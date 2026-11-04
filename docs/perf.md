@@ -769,6 +769,28 @@ plus first call.
 
 Numbers are in the plans' "## Result" sections.
 
+- 2026-11-04, GigaAM v3 e2e-rnnt and Parakeet TDT 0.6b v3, Q8_0, portable kernels, RADV Mesa 26.2.6.
+  The default adapter is a Radeon RX 5700 XT (Navi 10), with no cooperative
+  matrices. The Radeon 760M (Phoenix) reports 16×16×16 f16→f16 and f16→f32 and still runs
+  portable: the 16×16 tier stays on NVIDIA's vendor id (2026-10-11). `wavo bench -n 10`,
+  `WGPU_ADAPTER_NAME` `5700` then `760M`, one run of 10 warm calls. Warm min is within 1% of the
+  median. 5700 XT median / min: GigaAM `ru` 41.5 / 41.1, `ru-long` 146.8 / 146.2, Parakeet `jfk`
+  106.8 / 105.9, `dots` 261.5 / 260.4 ms. 760M: 52.7 / 52.1, 346.5 / 344.3, 197.4 / 195.7, 583.0 /
+  581.4 ms. Load 73–135 ms, apart from two 760M Parakeet loads at 378 and 578 ms.
+  `wavo bench -n 1 --profile` times each dispatch in its own pass. The span runs a few percent
+  above the kernel sum, and that sum is not the span of a normal submission. On the 5700 XT, call
+  1 and call 2 agree within 0.2%. Call 2, 278 dispatches for GigaAM and 437 for Parakeet, kernels
+  (GEMM, attention, other): `ru` 34.4 ms (33.4, 0.5, 0.5), Q8 GEMM 29.2 ms, 85%; `ru-long` 111.0
+  (96.6, 12.3, 2.0), Q8 83.2, 75%, flash 12.3; `jfk` 83.3 (79.3, 2.6, 1.4), Q8 69.1, 83%; `dots`
+  171.3 (144.8, 22.5, 3.9), Q8 128.0, 75%, relative attention 22.5. The unprofiled medians sit
+  about 7, 36, 24 and 90 ms above those sums, in that clip order. On the 760M the first profiled
+  call was slower for `ru-long` (363 vs 313 ms of kernels) and `jfk` (233 vs 174); `dots` stayed
+  near 490 (call 2: 491.5, GEMM 436.2, attention 40.3, other 14.9). Call 2 on `ru-long` is 313.4
+  (263.5, 40.6, 9.2) and on `jfk` 174.2 (164.7, 5.7, 3.8). Q8 GEMM is 70–81% of every 760M kernel
+  sum. The short `ru` profile stayed near 100 ms of kernels (call 2 wall 111.6) against the warm
+  median of 52.7, so that breakdown is not the warm GPU. `layer_norm` and `conv_glu` stay around
+  1–3% beside the Q8 GEMM.
+
 - 2026-10-12, Whisper turbo decoder on the RTX 4060, `ru-long` (117 steps), after the decoder
   entries of that day (GPU timestamps, each dispatch in its own pass): per token the gemvs 0.74
   ms (168 MB of Q8_0 at ~228 GB/s of the 272 peak; the head alone ~258), cross `attend` 0.14,
