@@ -36,7 +36,7 @@ Commands:
   list                         list downloaded models
   rm MODEL                     delete a downloaded model
   bench MODEL AUDIO [-n N]     time the model load, the first call and N more calls (10);
-                               takes --backend and --device too
+                               takes --backend, --device and --profile (GPU time per dispatch)
   serve [MODEL...] [OPTIONS]   serve the models (parakeet-ultra by default; the first
                                answers unknown model names) over OpenAI's transcription API
   devices                      list the GPUs, numbered for --device
@@ -587,11 +587,12 @@ fn rm(arg: &str) -> Result<()> {
   Ok(())
 }
 
-const BENCH: &str = "usage: wavo bench MODEL AUDIO [-n N] [--backend B] [--device D]";
+const BENCH: &str = "usage: wavo bench MODEL AUDIO [-n N] [--backend B] [--device D] [--profile]";
 
 /// Load time, first call and warm median/min over `-n` calls (10), in milliseconds.
 fn bench(model: &str, audio: &str, opts: &[&str]) -> Result<()> {
-  let (mut n, mut on, mut gpu, mut opts) = (10, Backend::Auto, None, opts.iter());
+  let (mut n, mut on, mut gpu, mut profile, mut opts) =
+    (10, Backend::Auto, None, false, opts.iter());
   while let Some(&opt) = opts.next() {
     match opt {
       "-n" => {
@@ -600,8 +601,12 @@ fn bench(model: &str, audio: &str, opts: &[&str]) -> Result<()> {
       }
       "--backend" => on = backend(opts.next())?,
       "--device" => gpu = Some(device(opts.next())?),
+      "--profile" => profile = true,
       _ => bail!(BENCH),
     }
+  }
+  if profile {
+    wavo::profile_dispatches(true);
   }
 
   let on = target(on, gpu)?;

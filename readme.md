@@ -100,6 +100,7 @@ wavo run whisper-turbo talk.mp3 --language he  # Whisper: set the language, not 
 wavo list                             # downloaded models
 wavo rm parakeet-ultra                # delete one
 wavo bench gigaam-v3 talk.wav         # load time and speed on your machine
+wavo bench gigaam-v3 talk.wav --profile  # the same, plus GPU time per dispatch
 wavo debug                            # your system, GPUs and models, to paste into an issue
 wavo run talk.wav --backend gpu       # the GPU even where the Neural Engine is ready
 wavo run gigaam-v3 talk.wav --backend cpu  # on the CPU, as without a GPU
