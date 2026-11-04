@@ -3,7 +3,7 @@
 //! Each kernel has a portable version; a fast one (subgroups, cooperative matrices) replaces it
 //! when the device supports it and a probe dispatch of that pipeline succeeds.
 
-use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock, PoisonError, mpsc};
 
 use wgpu::BindGroup;
@@ -12,7 +12,43 @@ pub use wgpu::Buffer;
 use crate::error::{Error, Result, bail};
 use crate::gguf::{Tensor, Type};
 
-type Pipeline = wgpu::ComputePipeline;
+/// Set before [`crate::Model::load`] so each later dispatch is timed.
+static PROFILE: AtomicBool = AtomicBool::new(false);
+
+/// Time each GPU dispatch of models loaded after this call.
+///
+/// Each dispatch runs in its own compute pass, so the passes do not overlap and the span runs a
+/// little high. `wavo bench --profile` sets it, and so does `WAVO_GPU_PROFILE=1`. The adapter
+/// must support timestamp queries; otherwise dispatches are not timed.
+pub fn profile_dispatches(enabled: bool) {
+  PROFILE.store(enabled, Ordering::Relaxed);
+}
+
+fn profile_requested() -> bool {
+  PROFILE.load(Ordering::Relaxed)
+    || std::env::var_os("WAVO_GPU_PROFILE").is_some_and(|v| v != "0" && v != "false")
+}
+
+/// A compute pipeline and the kernel name a profile groups it under.
+#[derive(Clone)]
+pub(crate) struct Pipeline {
+  inner: wgpu::ComputePipeline,
+  name: &'static str,
+}
+
+impl PartialEq for Pipeline {
+  fn eq(&self, other: &Self) -> bool {
+    self.inner == other.inner
+  }
+}
+
+impl std::ops::Deref for Pipeline {
+  type Target = wgpu::ComputePipeline;
+
+  fn deref(&self) -> &Self::Target {
+    &self.inner
+  }
+}
 
 /// Bind groups cached per dispatch, each with the pipeline and buffers it was made for.
 pub type Groups = Vec<(Pipeline, Vec<Buffer>, BindGroup)>;
@@ -235,6 +271,10 @@ pub struct Gpu {
   failure: Arc<Mutex<Option<String>>>,
   /// The tensor GEMM's input as f16, grown to the largest so far (bind groups keep older ones).
   halves: Mutex<Option<Buffer>>,
+  /// Time each dispatch. Stays false through the load probes, then turns on when requested.
+  profile: bool,
+  /// Nanoseconds per timestamp tick; 0 when timestamps are off.
+  period: f32,
 }
 
 /// The portable kernels, which every adapter runs; `Fast` replaces some of them.
@@ -475,6 +515,10 @@ impl Gpu {
     let mappable = adapter.get_info().device_type == wgpu::DeviceType::IntegratedGpu
       && adapter.features().contains(wgpu::Features::MAPPABLE_PRIMARY_BUFFERS);
     let mut features = wgpu::Features::IMMEDIATES;
+    let stamp = profile_requested() && adapter.features().contains(wgpu::Features::TIMESTAMP_QUERY);
+    if stamp {
+      features |= wgpu::Features::TIMESTAMP_QUERY;
+    }
     if fast {
       features |= COOP;
     }
@@ -535,6 +579,7 @@ impl Gpu {
         mapped_at_creation: false,
       })
     };
+    let period = if stamp { queue.get_timestamp_period() } else { 0.0 };
     let spare = buffer(4, wgpu::BufferUsages::STORAGE);
     let marks = buffer(MARKS * 4, wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC);
     let marks_read = buffer(MARKS * 4, wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST);
@@ -553,6 +598,8 @@ impl Gpu {
       busy: Mutex::new(()),
       failure,
       halves: Mutex::new(None),
+      profile: false,
+      period,
     };
     if let (Some(size), Some(compiled)) = (size, compiled) {
       gpu.fast = gpu.probe(size, compiled);
@@ -573,6 +620,8 @@ impl Gpu {
       16 => Kernels::Matrix16,
       _ => Kernels::Portable,
     };
+    // Probes above use ordinary passes. Timing starts with the first real call.
+    gpu.profile = stamp;
     Ok(gpu)
   }
 
@@ -897,10 +946,8 @@ impl Gpu {
     }
   }
 
-  fn begin(&self) -> (wgpu::CommandEncoder, wgpu::ComputePass<'static>) {
-    let mut encoder = self.device.create_command_encoder(&Default::default());
-    let pass = encoder.begin_compute_pass(&Default::default()).forget_lifetime();
-    (encoder, pass)
+  fn encoder(&self) -> wgpu::CommandEncoder {
+    self.device.create_command_encoder(&Default::default())
   }
 
   /// Records the dispatches of `record` (one submission, or more with `Pass::layers`), runs them,
@@ -958,12 +1005,13 @@ impl Gpu {
     let mut p = Pass::new(self, groups, call);
     record(&mut p);
     p.mark(out);
+    let stamps = p.finish_stamps();
     let Pass { mut encoder, pass, marked, .. } = p;
     drop(pass);
     let (size, marks) = ((len * 4) as u64, marked as u64 * 4);
     encoder.copy_buffer_to_buffer(out, 0, read, 0, size);
     encoder.copy_buffer_to_buffer(&self.marks, 0, &self.marks_read, 0, marks);
-    Recorded { commands: encoder.finish(), call, size, marks }
+    Recorded { commands: encoder.finish(), call, size, marks, stamps }
   }
 
   fn complete(
@@ -973,23 +1021,36 @@ impl Gpu {
     read: &Buffer,
     meanwhile: impl FnOnce(),
   ) -> Result<Vec<f32>> {
-    let Recorded { commands, call, size, marks } = r;
+    let Recorded { commands, call, size, marks, stamps } = r;
     self.queue.submit([commands]);
     meanwhile();
 
-    let slices = [read.slice(..size), self.marks_read.slice(..marks)];
+    let stamp_bytes = stamps.as_ref().map(|s| s.queries as u64 * u64::from(wgpu::QUERY_SIZE));
     let (tx, rx) = mpsc::channel();
-    for slice in &slices {
+    let map = |slice: wgpu::BufferSlice<'_>| {
       let tx = tx.clone();
       slice.map_async(wgpu::MapMode::Read, move |r| tx.send(r).unwrap());
+    };
+    map(read.slice(..size));
+    map(self.marks_read.slice(..marks));
+    if let Some(s) = &stamps {
+      map(s.read.slice(..stamp_bytes.unwrap()));
     }
+    let maps = 2 + usize::from(stamps.is_some());
     self.device.poll(wgpu::PollType::wait_indefinitely())?;
-    for _ in &slices {
+    for _ in 0..maps {
       rx.recv().unwrap()?;
     }
-    let data = bytemuck::cast_slice(&slices[0].get_mapped_range()?).to_vec();
-    let done =
-      bytemuck::cast_slice::<_, u32>(&slices[1].get_mapped_range()?).iter().all(|&m| m == call);
+    let data = bytemuck::cast_slice(&read.slice(..size).get_mapped_range()?).to_vec();
+    let done = bytemuck::cast_slice::<_, u32>(&self.marks_read.slice(..marks).get_mapped_range()?)
+      .iter()
+      .all(|&m| m == call);
+    if let Some(s) = &stamps {
+      let ticks =
+        bytemuck::cast_slice(&s.read.slice(..stamp_bytes.unwrap()).get_mapped_range()?).to_vec();
+      report_profile(call, s, &ticks);
+      s.read.unmap();
+    }
     read.unmap();
     self.marks_read.unmap();
     if let Some(failure) = self.failure.lock().unwrap_or_else(PoisonError::into_inner).take() {
@@ -1002,6 +1063,133 @@ impl Gpu {
   }
 }
 
+/// Timestamps for one call: two queries per dispatch, up to [`wgpu::QUERY_SET_MAX_QUERIES`].
+struct Stamps {
+  queries: wgpu::QuerySet,
+  names: Vec<&'static str>,
+  next: u32,
+  truncated: bool,
+  resolve: Buffer,
+  read: Buffer,
+}
+
+impl Stamps {
+  fn new(gpu: &Gpu) -> Self {
+    let count = wgpu::QUERY_SET_MAX_QUERIES;
+    let queries = gpu.device.create_query_set(&wgpu::QuerySetDescriptor {
+      label: None,
+      ty: wgpu::QueryType::Timestamp,
+      count,
+    });
+    let bytes = u64::from(count) * u64::from(wgpu::QUERY_SIZE);
+    let buffer = |usage| {
+      gpu.device.create_buffer(&wgpu::BufferDescriptor {
+        label: None,
+        size: bytes,
+        usage,
+        mapped_at_creation: false,
+      })
+    };
+    Self {
+      queries,
+      names: Vec::new(),
+      next: 0,
+      truncated: false,
+      resolve: buffer(wgpu::BufferUsages::QUERY_RESOLVE | wgpu::BufferUsages::COPY_SRC),
+      read: buffer(wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST),
+    }
+  }
+
+  /// The beginning and end query of one dispatch, or `None` once the set is full.
+  fn slot(&mut self, name: &'static str) -> Option<(u32, u32)> {
+    if self.next + 2 > wgpu::QUERY_SET_MAX_QUERIES {
+      self.truncated = true;
+      return None;
+    }
+    let start = self.next;
+    self.next += 2;
+    self.names.push(name);
+    Some((start, start + 1))
+  }
+}
+
+/// Resolved timestamps waiting to be mapped.
+struct StampDump {
+  read: Buffer,
+  names: Vec<&'static str>,
+  queries: u32,
+  truncated: bool,
+  period: f32,
+}
+
+fn open_pass(encoder: &mut wgpu::CommandEncoder) -> wgpu::ComputePass<'static> {
+  encoder.begin_compute_pass(&Default::default()).forget_lifetime()
+}
+
+/// Prints one call's dispatch times. Isolated passes, so the span includes the gaps between them.
+fn report_profile(call: u32, dump: &StampDump, ticks: &[u64]) {
+  let mut totals: Vec<(&str, f64, u32)> = Vec::new();
+  let mut first = None;
+  let mut last = 0u64;
+  for (i, name) in dump.names.iter().enumerate() {
+    let (a, b) = (ticks[i * 2], ticks[i * 2 + 1]);
+    let ms = b.wrapping_sub(a) as f64 * f64::from(dump.period) / 1e6;
+    if first.is_none() {
+      first = Some(a);
+    }
+    last = b;
+    match totals.iter_mut().find(|row| row.0 == *name) {
+      Some(row) => {
+        row.1 += ms;
+        row.2 += 1;
+      }
+      None => totals.push((name, ms, 1)),
+    }
+  }
+  totals.sort_by(|p, q| q.1.total_cmp(&p.1));
+  let sum: f64 = totals.iter().map(|row| row.1).sum();
+  let span = last.wrapping_sub(first.unwrap_or(0)) as f64 * f64::from(dump.period) / 1e6;
+  fn is_gemm(n: &str) -> bool {
+    n.starts_with("gemm") || n.starts_with("gemv") || n.starts_with("embed") || n == "cast"
+  }
+  fn is_attention(n: &str) -> bool {
+    n == "flash"
+      || n == "relative"
+      || n == "attention"
+      || n == "scores"
+      || n == "softmax"
+      || n == "values"
+      || n == "attend"
+      || n == "combine"
+  }
+  let share = |pred: fn(&str) -> bool| -> f64 {
+    totals.iter().filter(|row| pred(row.0)).map(|row| row.1).sum()
+  };
+  let gemm = share(is_gemm);
+  let attention = share(is_attention);
+  let other = share(|n| !is_gemm(n) && !is_attention(n));
+  let n = dump.names.len();
+  let ms = |x: f64| if x == 0.0 { 0.0 } else { x };
+  eprintln!(
+    "gpu profile call {call}: {n} dispatches, kernels {:.3} ms, span {:.3} ms (gemm {:.3}, attention {:.3}, other {:.3})",
+    ms(sum),
+    ms(span),
+    ms(gemm),
+    ms(attention),
+    ms(other),
+  );
+  for (name, time, count) in &totals {
+    let pct = if sum > 0.0 { time / sum * 100.0 } else { 0.0 };
+    eprintln!("  {name:<16} {:8.3} ms  {pct:5.1}%  {count}", ms(*time));
+  }
+  if dump.truncated {
+    eprintln!(
+      "  timed {} dispatches; the rest of the call was not",
+      wgpu::QUERY_SET_MAX_QUERIES / 2
+    );
+  }
+}
+
 /// A call recorded by `Gpu::record`, to run with `Gpu::finish`.
 pub struct Recorded {
   commands: wgpu::CommandBuffer,
@@ -1009,6 +1197,8 @@ pub struct Recorded {
   /// Bytes to read back: the output and the marks.
   size: u64,
   marks: u64,
+  /// Per-dispatch timestamps, when profiling.
+  stamps: Option<StampDump>,
 }
 
 /// A weight buffer being written (see `Gpu::fill`).
@@ -1223,7 +1413,7 @@ fn compile_tensor(device: &wgpu::Device) -> Option<TensorGemm> {
   // the Metal slots their layouts below give them.
   let module = unsafe { device.create_shader_module_passthrough(desc) };
   // Passthrough modules have no reflection: storage buffers in order, the one at `out` writable.
-  let pipeline = |entry: &str, bindings: u32, out: u32, immediates: u32| {
+  let pipeline = |entry: &'static str, bindings: u32, out: u32, immediates: u32| {
     let entries: Vec<_> = (0..bindings)
       .map(|binding| wgpu::BindGroupLayoutEntry {
         binding,
@@ -1243,14 +1433,17 @@ fn compile_tensor(device: &wgpu::Device) -> Option<TensorGemm> {
       bind_group_layouts: &[Some(&group)],
       immediate_size: immediates,
     });
-    device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
-      label: Some(entry),
-      layout: Some(&layout),
-      module: &module,
-      entry_point: Some(entry),
-      compilation_options: Default::default(),
-      cache: None,
-    })
+    Pipeline {
+      inner: device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+        label: Some(entry),
+        layout: Some(&layout),
+        module: &module,
+        entry_point: Some(entry),
+        compilation_options: Default::default(),
+        cache: None,
+      }),
+      name: entry,
+    }
   };
   let cast = pipeline("cast", 2, 1, 4);
   let gemm = names[1..].iter().map(|n| pipeline(n, 5, 2, 24)).collect();
@@ -1268,24 +1461,47 @@ fn module(device: &wgpu::Device, source: &str) -> wgpu::ShaderModule {
 fn pipeline(
   device: &wgpu::Device,
   module: &wgpu::ShaderModule,
-  entry: &str,
+  entry: &'static str,
   constants: &[(&str, f64)],
 ) -> Pipeline {
-  device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
-    label: Some(entry),
-    layout: None,
-    module,
-    entry_point: Some(entry),
-    compilation_options: wgpu::PipelineCompilationOptions {
-      constants,
-      zero_initialize_workgroup_memory: false,
-    },
-    cache: None,
-  })
+  Pipeline {
+    name: kernel_name(entry, constants),
+    inner: device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+      label: Some(entry),
+      layout: None,
+      module,
+      entry_point: Some(entry),
+      compilation_options: wgpu::PipelineCompilationOptions {
+        constants,
+        zero_initialize_workgroup_memory: false,
+      },
+      cache: None,
+    }),
+  }
+}
+
+/// The profile name: the entry point, and the weight type when the pipeline is specialized on it.
+fn kernel_name(entry: &'static str, constants: &[(&str, f64)]) -> &'static str {
+  let ty = constants.iter().find(|(key, _)| *key == "WTYPE").map(|(_, ty)| *ty as u8);
+  match (entry, ty) {
+    ("gemm", Some(0)) => "gemm f32",
+    ("gemm", Some(1)) => "gemm f16",
+    ("gemm", Some(2)) => "gemm q8",
+    ("gemm64", Some(0)) => "gemm64 f32",
+    ("gemm64", Some(1)) => "gemm64 f16",
+    ("gemm64", Some(2)) => "gemm64 q8",
+    ("gemv", Some(0)) => "gemv f32",
+    ("gemv", Some(1)) => "gemv f16",
+    ("gemv", Some(2)) => "gemv q8",
+    ("embed", Some(0)) => "embed f32",
+    ("embed", Some(1)) => "embed f16",
+    ("embed", Some(2)) => "embed q8",
+    _ => entry,
+  }
 }
 
 /// The `entry` specialized for each weight type.
-fn gemms(device: &wgpu::Device, module: &wgpu::ShaderModule, entry: &str) -> Vec<Pipeline> {
+fn gemms(device: &wgpu::Device, module: &wgpu::ShaderModule, entry: &'static str) -> Vec<Pipeline> {
   (0..3).map(|ty| pipeline(device, module, entry, &[("WTYPE", ty as f64)])).collect()
 }
 
@@ -1293,7 +1509,8 @@ fn gemms(device: &wgpu::Device, module: &wgpu::ShaderModule, entry: &str) -> Vec
 pub struct Pass<'a> {
   gpu: &'a Gpu,
   encoder: wgpu::CommandEncoder,
-  pass: wgpu::ComputePass<'static>,
+  /// Open between dispatches. Absent while profiling: each dispatch is its own pass.
+  pass: Option<wgpu::ComputePass<'static>>,
   groups: &'a mut Groups,
   next: usize,
   /// The call's number and the submissions marked so far (see `Gpu::marks`).
@@ -1301,12 +1518,15 @@ pub struct Pass<'a> {
   marked: u32,
   /// The last submission `flush` made.
   queued: Option<wgpu::SubmissionIndex>,
+  /// Timestamps for this call. One query set, so at most 2048 dispatches are timed.
+  stamps: Option<Stamps>,
 }
 
 impl<'a> Pass<'a> {
   fn new(gpu: &'a Gpu, groups: &'a mut Groups, call: u32) -> Self {
-    let (encoder, pass) = gpu.begin();
-    Self { gpu, encoder, pass, groups, next: 0, call, marked: 0, queued: None }
+    let mut encoder = gpu.encoder();
+    let pass = (!gpu.profile).then(|| open_pass(&mut encoder));
+    Self { gpu, encoder, pass, groups, next: 0, call, marked: 0, queued: None, stamps: None }
   }
 
   /// Records an encoder's layers, `layer(pass, item)` for each item, each returning the buffer it
@@ -1328,8 +1548,11 @@ impl<'a> Pass<'a> {
       return;
     }
     self.mark(after);
-    let (encoder, pass) = self.gpu.begin();
-    drop(std::mem::replace(&mut self.pass, pass));
+    self.pass.take();
+    let mut encoder = self.gpu.encoder();
+    if !self.gpu.profile {
+      self.pass = Some(open_pass(&mut encoder));
+    }
     let done = std::mem::replace(&mut self.encoder, encoder);
     let index = self.gpu.queue.submit([done.finish()]);
     if let Some(previous) = self.queued.replace(index) {
@@ -1385,10 +1608,64 @@ impl<'a> Pass<'a> {
     params: &[u32],
     [x, y, z]: [usize; 3],
   ) {
-    self.pass.set_pipeline(kernel);
-    self.pass.set_bind_group(0, group, &[]);
-    self.pass.set_immediates(0, bytemuck::cast_slice(params));
-    self.pass.dispatch_workgroups(x as u32, y as u32, z as u32);
+    if self.gpu.profile {
+      self.timed(kernel, group, params, [x, y, z]);
+      return;
+    }
+    let pass = self.pass.as_mut().unwrap();
+    pass.set_pipeline(&kernel.inner);
+    pass.set_bind_group(0, group, &[]);
+    pass.set_immediates(0, bytemuck::cast_slice(params));
+    pass.dispatch_workgroups(x as u32, y as u32, z as u32);
+  }
+
+  /// One pass per dispatch, with a timestamp at each end, so the delta is that dispatch.
+  fn timed(&mut self, kernel: &Pipeline, group: &BindGroup, params: &[u32], [x, y, z]: [usize; 3]) {
+    if self.stamps.is_none() {
+      self.stamps = Some(Stamps::new(self.gpu));
+    }
+    let pair = self.stamps.as_mut().unwrap().slot(kernel.name);
+    self.pass.take();
+    let mut pass = match pair {
+      Some((start, end)) => {
+        let queries = &self.stamps.as_ref().unwrap().queries;
+        self
+          .encoder
+          .begin_compute_pass(&wgpu::ComputePassDescriptor {
+            label: None,
+            timestamp_writes: Some(wgpu::ComputePassTimestampWrites {
+              query_set: queries,
+              beginning_of_pass_write_index: Some(start),
+              end_of_pass_write_index: Some(end),
+            }),
+          })
+          .forget_lifetime()
+      }
+      None => open_pass(&mut self.encoder),
+    };
+    pass.set_pipeline(&kernel.inner);
+    pass.set_bind_group(0, group, &[]);
+    pass.set_immediates(0, bytemuck::cast_slice(params));
+    pass.dispatch_workgroups(x as u32, y as u32, z as u32);
+  }
+
+  /// Resolves this call's timestamps into a buffer the caller maps after the submit.
+  fn finish_stamps(&mut self) -> Option<StampDump> {
+    let stamps = self.stamps.take()?;
+    if stamps.names.is_empty() {
+      return None;
+    }
+    let n = stamps.next;
+    self.encoder.resolve_query_set(&stamps.queries, 0..n, &stamps.resolve, 0);
+    let bytes = n as u64 * u64::from(wgpu::QUERY_SIZE);
+    self.encoder.copy_buffer_to_buffer(&stamps.resolve, 0, &stamps.read, 0, bytes);
+    Some(StampDump {
+      read: stamps.read,
+      names: stamps.names,
+      queries: n,
+      truncated: stamps.truncated,
+      period: self.gpu.period,
+    })
   }
 
   /// `c = epilogue(a·Wᵀ + b)` for `m` rows of `a`.
@@ -1942,6 +2219,23 @@ mod tests {
         }
       }
     }
+  }
+
+  /// Timestamps run each dispatch in its own pass. The numbers stay the layer norm's.
+  #[test]
+  fn profiled_layer_norm() {
+    profile_dispatches(true);
+    let gpu = Gpu::new(false, None).unwrap();
+    assert!(gpu.profile, "this adapter does not support timestamp queries");
+    let (rows, cols) = (37, 192);
+    let x = random(rows * cols, 5);
+    let (g, b) = (random(cols, 6), random(cols, 7));
+    let y = layer_norm(&x, &g, &b);
+    let n = gpu.channels(&g, &b).unwrap();
+    let xb = up(&gpu, &x);
+    let got =
+      run(&gpu, &vec![0.0; rows * cols], |p, out| p.layer_norm(&xb, &n, out, rows, cols, None));
+    assert_close(&got, &y);
   }
 
   #[test]
