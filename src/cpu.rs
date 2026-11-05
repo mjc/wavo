@@ -5,7 +5,7 @@ use std::sync::{Mutex, PoisonError};
 
 use half::f16;
 
-use crate::error::Result;
+use crate::error::{Result, bail};
 use crate::gguf::{Tensor, Type, q4_codes, q5_codes};
 
 /// Dot product with 16 independent accumulators (four FMA vectors in flight), summed pairwise so
@@ -116,7 +116,8 @@ fn tile<const R: usize, const F: usize>(w: &[f32], z: &[f32], k: usize) -> [[f32
 
 /// Weights `[rows][k]` for `matvecs`. Q8_0, Q5_0 and Q4_0 keep signed codes and one f32 scale per
 /// 32 weights (`q · d`, exact in f32). Q4_1, Q5_1 and Q4_K expand to f32, because each block also
-/// has a minimum. F32 and F16 stay as f32, as the reference reads them.
+/// has a minimum. A Q4_1 or Q5_1 flat length has to be a whole number of blocks, or the last row
+/// is short. F32 and F16 stay as f32, as the reference reads them.
 pub enum Matrix {
   Q8(Q8),
   F32 { k: usize, w: Vec<f32> },
@@ -125,6 +126,14 @@ pub enum Matrix {
 impl Matrix {
   pub fn new(t: &Tensor) -> Result<Self> {
     let k = t.dims[0];
+    if matches!(t.ty, Type::Q8_0 | Type::Q5_0 | Type::Q4_0) && !k.is_multiple_of(32) {
+      bail!("quantized rows of {k} weights are not a multiple of 32");
+    }
+    // Q4_1 and Q5_1 decode whole blocks into a flat buffer. A short buffer panics on the last row.
+    let n = t.len();
+    if matches!(t.ty, Type::Q4_1 | Type::Q5_1) && !n.is_multiple_of(32) {
+      bail!("quantized weights of {n} are not a whole number of blocks");
+    }
     Ok(match t.ty {
       Type::F32 | Type::F16 | Type::Q4_1 | Type::Q5_1 | Type::Q4_K => {
         Self::F32 { k, w: t.to_f32()? }
@@ -364,6 +373,40 @@ mod tests {
   use crate::gguf::{Gguf, Type};
 
   #[test]
+  fn quantized_matrices_require_block_aligned_rows() {
+    for (ty, block_size) in [(Type::Q8_0, 34), (Type::Q5_0, 22), (Type::Q4_0, 18)] {
+      let bytes = vec![0; block_size];
+      let g = Gguf::with_tensors(&[("w", &[40], ty, &bytes)]);
+      assert!(super::Matrix::new(&g.tensor("w", &[40]).unwrap()).is_err(), "{ty:?}");
+
+      let bytes = vec![0; block_size];
+      let g = Gguf::with_tensors(&[("w", &[32], ty, &bytes)]);
+      assert!(super::Matrix::new(&g.tensor("w", &[32]).unwrap()).is_ok(), "{ty:?}");
+    }
+  }
+
+  #[test]
+  fn affine_expansion_needs_whole_blocks() {
+    // [40, 2] stores two blocks (64 values). The second 40-wide row used to panic.
+    // Four rows of 40 are 160 values, five whole blocks, so a 40-wide row still loads.
+    for (ty, block) in [(Type::Q4_1, 20usize), (Type::Q5_1, 24)] {
+      let short = vec![0; 2 * block];
+      let g = Gguf::with_tensors(&[("w", &[40, 2], ty, &short)]);
+      match super::Matrix::new(&g.tensor("w", &[40, 2]).unwrap()) {
+        Err(err) => {
+          assert!(err.to_string().contains("not a whole number of blocks"), "{ty:?}: {err}")
+        }
+        Ok(_) => panic!("{ty:?} accepted a short expansion"),
+      }
+
+      let full = vec![0; 5 * block];
+      let g = Gguf::with_tensors(&[("w", &[40, 4], ty, &full)]);
+      let w = super::Matrix::new(&g.tensor("w", &[40, 4]).unwrap()).unwrap();
+      assert_eq!(w.row(3), vec![0.0; 40], "{ty:?}");
+    }
+  }
+
+  #[test]
   fn matmul_matches_dot() {
     let (k, rows, frames) = (333, 8, 5);
     let v: Vec<f32> =
@@ -394,13 +437,19 @@ mod tests {
   fn matrices_load_every_tensor_type() {
     // 70 rows of 64 weights q/8 with q in -15..=15: exact in all three types, Q8_0 with scale 1/8.
     let (k, rows) = (64, 70);
-    let v: Vec<f32> = (0..rows * k).map(|i| (i * 7919 % 31) as f32 / 8.0 - 15.0 / 8.0).collect();
+    let v: Vec<f32> = (0..rows * k)
+      .map(|i| {
+        let d = 0.5 * (1 + ((i / 32) % 3)) as f32;
+        ((i % 31) as f32 - 15.0) * d
+      })
+      .collect();
     let f32s: Vec<u8> = v.iter().flat_map(|v| v.to_le_bytes()).collect();
     let f16s: Vec<u8> = v.iter().flat_map(|&v| f16::from_f32(v).to_le_bytes()).collect();
     let mut q8 = Vec::new();
-    for b in v.as_chunks::<32>().0 {
-      q8.extend(f16::from_f32(0.125).to_le_bytes());
-      q8.extend(b.map(|v| (v * 8.0) as i8 as u8));
+    for (i, b) in v.as_chunks::<32>().0.iter().enumerate() {
+      let d = 0.5 * (1 + (i % 3)) as f32;
+      q8.extend(f16::from_f32(d).to_le_bytes());
+      q8.extend(b.map(|v| (v / d) as i8 as u8));
     }
 
     let x: Vec<f32> = (0..k).map(|i| (i * 31 % 17) as f32 / 8.0 - 1.0).collect();
@@ -408,7 +457,9 @@ mod tests {
     for (ty, bytes) in [(Type::F32, f32s), (Type::F16, f16s), (Type::Q8_0, q8)] {
       let g = Gguf::with_tensors(&[("w", &[k, rows], ty, &bytes)]);
       let w = super::Matrix::new(&g.tensor("w", &[k, rows]).unwrap()).unwrap();
-      assert_eq!(w.row(69), v[69 * k..], "{ty:?}");
+      for r in 0..rows {
+        assert_eq!(w.row(r), v[r * k..(r + 1) * k], "{ty:?}, row {r}");
+      }
       let [got] = super::matvecs([(&w, &x)]);
       assert_eq!(got.into_iter().map(f32::to_bits).collect::<Vec<_>>(), want, "{ty:?}");
     }
@@ -419,13 +470,20 @@ mod tests {
     // Each block is codes 0..31 at scale 0.5, which quantizes back to itself. 70 rows: a full
     // 64-row block and a short one whose last 4-row group has 2 rows.
     let (k, rows) = (64, 70);
-    let v: Vec<f32> = (0..rows * k).map(|i| (i % 32) as f32 * 0.5 - 8.0).collect();
+    let v: Vec<f32> = (0..rows * k)
+      .map(|i| {
+        let d = 0.5 * (1 + ((i / 32) % 3)) as f32;
+        ((i % 32) as f32 - 16.0) * d
+      })
+      .collect();
     let q5 = crate::gguf::quantize_q5_0(&v);
     let x: Vec<f32> = (0..k).map(|i| (i * 31 % 17) as f32 / 8.0 - 1.0).collect();
     let want: Vec<u32> = v.chunks_exact(k).map(|r| super::dot(r, &x).to_bits()).collect();
     let g = Gguf::with_tensors(&[("w", &[k, rows], Type::Q5_0, &q5)]);
     let w = super::Matrix::new(&g.tensor("w", &[k, rows]).unwrap()).unwrap();
-    assert_eq!(w.row(69), v[69 * k..]);
+    for r in 0..rows {
+      assert_eq!(w.row(r), v[r * k..(r + 1) * k], "row {r}");
+    }
     let [got] = super::matvecs([(&w, &x)]);
     assert_eq!(got.into_iter().map(f32::to_bits).collect::<Vec<_>>(), want);
   }
@@ -437,12 +495,16 @@ mod tests {
     // 70 rows: a full 64-row block and a short one whose last 4-row group has 2 rows.
     let (k, rows) = (64, 70);
     let x: Vec<f32> = (0..k).map(|i| (i * 31 % 17) as f32 / 8.0 - 1.0).collect();
-    let cases = [
-      (Type::Q4_0, (0..rows * k).map(|i| (i % 16) as f32 - 8.0).collect::<Vec<_>>()),
-      (Type::Q4_1, (0..rows * k).map(|i| (i % 16) as f32 - 1.0).collect::<Vec<_>>()),
-      (Type::Q5_1, (0..rows * k).map(|i| (i % 32) as f32).collect::<Vec<_>>()),
-    ];
-    for (ty, v) in cases {
+    for (ty, levels, offset) in
+      [(Type::Q4_0, 16, -8.0), (Type::Q4_1, 16, -1.0), (Type::Q5_1, 32, 0.0)]
+    {
+      let v: Vec<f32> = (0..rows * k)
+        .map(|i| {
+          let scale = 0.5 * (1 + ((i / 32) % 3)) as f32;
+          let code = (i % levels) as f32;
+          if ty == Type::Q4_0 { (code - 8.0) * scale } else { code * scale + offset }
+        })
+        .collect();
       let bytes = match ty {
         Type::Q4_0 => crate::gguf::quantize_q4_0(&v),
         Type::Q4_1 => crate::gguf::quantize_q4_1(&v),
@@ -452,7 +514,9 @@ mod tests {
       let want: Vec<u32> = v.chunks_exact(k).map(|r| super::dot(r, &x).to_bits()).collect();
       let g = Gguf::with_tensors(&[("w", &[k, rows], ty, &bytes)]);
       let w = super::Matrix::new(&g.tensor("w", &[k, rows]).unwrap()).unwrap();
-      assert_eq!(w.row(69), v[69 * k..], "{ty:?}");
+      for r in 0..rows {
+        assert_eq!(w.row(r), v[r * k..(r + 1) * k], "{ty:?}, row {r}");
+      }
       let [got] = super::matvecs([(&w, &x)]);
       assert_eq!(got.into_iter().map(f32::to_bits).collect::<Vec<_>>(), want, "{ty:?}");
     }
