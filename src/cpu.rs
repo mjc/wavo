@@ -5,7 +5,7 @@ use std::sync::{Mutex, PoisonError};
 
 use half::f16;
 
-use crate::error::Result;
+use crate::error::{Result, bail};
 use crate::gguf::{Tensor, Type, q4_codes, q5_codes};
 
 /// Dot product with 16 independent accumulators (four FMA vectors in flight), summed pairwise so
@@ -125,6 +125,9 @@ pub enum Matrix {
 impl Matrix {
   pub fn new(t: &Tensor) -> Result<Self> {
     let k = t.dims[0];
+    if matches!(t.ty, Type::Q8_0 | Type::Q5_0 | Type::Q4_0) && !k.is_multiple_of(32) {
+      bail!("quantized rows of {k} weights are not a multiple of 32");
+    }
     Ok(match t.ty {
       Type::F32 | Type::F16 | Type::Q4_1 | Type::Q5_1 => Self::F32 { k, w: t.to_f32()? },
       Type::Q8_0 => {
@@ -360,6 +363,19 @@ mod tests {
   use half::f16;
 
   use crate::gguf::{Gguf, Type};
+
+  #[test]
+  fn quantized_matrices_require_block_aligned_rows() {
+    for (ty, block_size) in [(Type::Q8_0, 34), (Type::Q5_0, 22), (Type::Q4_0, 18)] {
+      let bytes = vec![0; block_size];
+      let g = Gguf::with_tensors(&[("w", &[40], ty, &bytes)]);
+      assert!(super::Matrix::new(&g.tensor("w", &[40]).unwrap()).is_err(), "{ty:?}");
+
+      let bytes = vec![0; block_size];
+      let g = Gguf::with_tensors(&[("w", &[32], ty, &bytes)]);
+      assert!(super::Matrix::new(&g.tensor("w", &[32]).unwrap()).is_ok(), "{ty:?}");
+    }
+  }
 
   #[test]
   fn matmul_matches_dot() {
