@@ -8,7 +8,8 @@
 // reference also rounds `a`, which costs ~2% here and no fixture needs. The module also holds
 // `gemv`, for one row of `a`, and `embed`.
 
-// Weight type, one pipeline each: 0: F32, 1: F16, 2: Q8_0, 3: Q5_0, 4: Q4_0, 5: Q4_1, 6: Q5_1.
+// Weight type, one pipeline each: 0: F32, 1: F16, 2: Q8_0, 3: Q5_0, 4: Q4_0, 5: Q4_1, 6: Q5_1,
+// 7: Q4_K.
 override WTYPE: u32;
 // Rows of the GEMM's tile: 64, or 32 (more workgroups).
 override ROWS: u32 = 64u;
@@ -34,10 +35,11 @@ var<immediate> p: Params;
 @group(0) @binding(1) var<storage, read> bias: array<f32>;
 @group(0) @binding(2) var<storage, read_write> c: array<f32>;
 // F32 as bits, F16 as pairs, Q8_0 as 4 int8 per word, Q4 as nibbles (16 bytes per 32), Q5 as
-// 5-bit codes (24 bytes per 32).
+// 5-bit codes (24 bytes per 32), Q4_K as nibbles (128 bytes per 256).
 @group(0) @binding(3) var<storage, read> w: array<u32>;
 // Q8_0, Q5_0 and Q4_0: one f16 scale per block, two per word. Q4_1 and Q5_1: an f16 scale and an
-// f16 minimum, one pair per word. Any buffer for the other types.
+// f16 minimum, one pair per word. Q4_K: 20 bytes per 256 weights (f16 scale, f16 minimum, eight
+// scales, eight minimums). Any buffer for the other types.
 @group(0) @binding(4) var<storage, read> scales: array<u32>;
 // `a` for the GEMM's 16-byte loads.
 @group(0) @binding(0) var<storage, read> a4: array<vec4<f32>>;
@@ -107,6 +109,32 @@ fn q41_4(x: u32) -> vec4<f32> {
 fn q51_4(x: u32) -> vec4<f32> {
   let s = dm(x / 32u);
   return q5_codes4(x) * s.x + s.y;
+}
+
+// Four Q4_K codes at weight x (a multiple of 4). Nibbles are in weight order, 128 bytes per 256.
+fn q4k_codes4(x: u32) -> vec4<f32> {
+  let block = x / 256u;
+  let local = x % 256u;
+  let word = w[block * 32u + local / 8u];
+  let bits = (word >> ((local % 8u) * 4u)) & 0xFFFFu;
+  return vec4(f32(bits & 15u), f32((bits >> 4u) & 15u), f32((bits >> 8u) & 15u), f32((bits >> 12u) & 15u));
+}
+
+// `d · scale` and `dmin · min` for the group of 32 that contains x.
+fn q4k_dm(x: u32) -> vec2<f32> {
+  let block = x / 256u;
+  let sub = (x % 256u) / 32u;
+  let base = block * 5u;
+  let hd = unpack2x16float(scales[base]);
+  let shift = (sub % 4u) * 8u;
+  let scale = (scales[base + 1u + sub / 4u] >> shift) & 255u;
+  let min = (scales[base + 3u + sub / 4u] >> shift) & 255u;
+  return vec2(hd.x * f32(scale), hd.y * f32(min));
+}
+
+fn q4k_4(x: u32) -> vec4<f32> {
+  let s = q4k_dm(x);
+  return q4k_codes4(x) * s.x - s.y;
 }
 
 fn lane(v: vec4<f32>, x: u32) -> f32 {
@@ -179,6 +207,7 @@ fn w_words(n: u32, k: u32) -> vec4<u32> {
     case 4u: { return bitcast<vec4<u32>>(q4_4(x)); }
     case 5u: { return bitcast<vec4<u32>>(q41_4(x)); }
     case 6u: { return bitcast<vec4<u32>>(q51_4(x)); }
+    case 7u: { return bitcast<vec4<u32>>(q4k_4(x)); }
     default: { return vec4(w[x / 4u], scales[x / 64u], (x / 32u) & 1u, 0u); }
   }
 }
@@ -189,7 +218,7 @@ fn w_floats(v: vec4<u32>) -> vec4<f32> {
   switch WTYPE {
     case 0u: { x = bitcast<vec4<f32>>(v); }
     case 1u: { x = vec4(unpack2x16float(v.x), unpack2x16float(v.y)); }
-    case 3u, 4u, 5u, 6u: { x = bitcast<vec4<f32>>(v); }
+    case 3u, 4u, 5u, 6u, 7u: { x = bitcast<vec4<f32>>(v); }
     default: {
       let s = unpack2x16float(v.y);
       x = vec4<f32>(unpack4xI8(v.x)) * select(s.x, s.y, v.z == 1u);
@@ -324,6 +353,7 @@ fn dot8(row: u32, j: u32, a0: vec4<f32>, a1: vec4<f32>) -> f32 {
     case 4u: { return dot(q4_4(x), a0) + dot(q4_4(x + 4u), a1); }
     case 5u: { return dot(q41_4(x), a0) + dot(q41_4(x + 4u), a1); }
     case 6u: { return dot(q51_4(x), a0) + dot(q51_4(x + 4u), a1); }
+    case 7u: { return dot(q4k_4(x), a0) + dot(q4k_4(x + 4u), a1); }
     default: {
       let q = x / 4u;
       let d = dot(vec4<f32>(unpack4xI8(w[q])), a0) + dot(vec4<f32>(unpack4xI8(w[q + 1u])), a1);
@@ -393,6 +423,7 @@ fn embed(@builtin(global_invocation_id) id: vec3<u32>) {
     case 4u: { v = lane(q4_4(x & ~3u), x); }
     case 5u: { v = lane(q41_4(x & ~3u), x); }
     case 6u: { v = lane(q51_4(x & ~3u), x); }
+    case 7u: { v = lane(q4k_4(x & ~3u), x); }
     default: { v = f32(unpack4xI8(w[x / 4u])[x % 4u]) * scale(x / 32u); }
   }
   c[i] = v + a[p.offset + i] + bias[i];
