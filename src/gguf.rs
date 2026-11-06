@@ -1,6 +1,6 @@
 // Copyright (c) vladkens | MIT License | https://github.com/vladkens/wavo
-//! GGUF v3 reader: metadata from the header, F32/F16/Q8_0/Q5_0/Q4_0/Q4_1/Q5_1 tensors streamed
-//! from the file.
+//! GGUF v3 reader: metadata from the header, F32/F16/Q8_0/Q5_0/Q4_0/Q4_1/Q5_1/Q4_K tensors
+//! streamed from the file.
 
 use std::collections::HashMap;
 use std::fmt::Debug;
@@ -30,6 +30,13 @@ pub enum Type {
   /// Blocks of 32 weights: f16 scale, f16 minimum, 4 high-bit bytes, 16 low nibbles (24 bytes). A
   /// weight is `code · scale + minimum`, with `code` in 0..31.
   Q5_1,
+  /// Blocks of 256 weights: f16 superblock scale, f16 superblock minimum, 12 bytes of 6-bit
+  /// scales and minimums, 128 bytes of nibbles (144 bytes). A weight is
+  /// `code · d · scale - dmin · min`, with `code` in 0..15 and `scale` and `min` in 0..63. The
+  /// element count is a multiple of 256. Blocks follow weight order, so a row whose length is not
+  /// a multiple of 256 shares a block with the next row.
+  #[allow(non_camel_case_types)]
+  Q4_K,
 }
 
 impl Type {
@@ -42,6 +49,7 @@ impl Type {
       6 => Some(Self::Q5_0),
       7 => Some(Self::Q5_1),
       8 => Some(Self::Q8_0),
+      12 => Some(Self::Q4_K),
       _ => None,
     }
   }
@@ -55,6 +63,7 @@ impl Type {
       Self::Q4_0 => n / 32 * 18,
       Self::Q4_1 => n / 32 * 20,
       Self::Q5_1 => n / 32 * 24,
+      Self::Q4_K => n / 256 * 144,
     }
   }
 }
@@ -144,6 +153,83 @@ pub(crate) fn q4_0_packed(block: &[u8; 18]) -> [u8; 16] {
 pub(crate) fn q4_1_packed(block: &[u8; 20]) -> [u8; 16] {
   let qs: &[u8; 16] = block[4..].try_into().unwrap();
   q4_packed(qs)
+}
+
+/// 6-bit scale and minimum of sub-block `j` (0..8) from a Q4_K block's 12 scale bytes.
+pub(crate) fn scale_min_k4(scales: &[u8; 12], j: usize) -> (u8, u8) {
+  if j < 4 {
+    (scales[j] & 63, scales[j + 4] & 63)
+  } else {
+    let scale = (scales[j + 4] & 0x0f) | ((scales[j - 4] >> 6) << 4);
+    let min = (scales[j + 4] >> 4) | ((scales[j] >> 6) << 4);
+    (scale, min)
+  }
+}
+
+/// Eight 6-bit scales and eight 6-bit minimums packed into the 12 byte Q4_K scale field.
+#[cfg(test)]
+fn pack_scales_k4(scale: &[u8; 8], min: &[u8; 8]) -> [u8; 12] {
+  let mut s = [0u8; 12];
+  for j in 0..8 {
+    if j < 4 {
+      s[j] = scale[j];
+      s[j + 4] = min[j];
+    } else {
+      s[j + 4] = (scale[j] & 0x0f) | ((min[j] & 0x0f) << 4);
+      s[j - 4] |= (scale[j] >> 4) << 6;
+      s[j] |= (min[j] >> 4) << 6;
+    }
+  }
+  s
+}
+
+/// Codes 0..15 of one Q4_K block, in weight order. Each 32 bytes hold one group of 32 in the low
+/// nibbles and the next group in the high nibbles.
+pub(crate) fn q4k_codes(qs: &[u8; 128]) -> [u8; 256] {
+  let mut codes = [0u8; 256];
+  for j in (0..256).step_by(64) {
+    for l in 0..32 {
+      let byte = qs[j / 2 + l];
+      codes[j + l] = byte & 0x0f;
+      codes[j + l + 32] = byte >> 4;
+    }
+  }
+  codes
+}
+
+#[cfg(test)]
+fn pack_qs_k4(codes: &[u8; 256]) -> [u8; 128] {
+  let mut qs = [0u8; 128];
+  for j in (0..256).step_by(64) {
+    for l in 0..32 {
+      qs[j / 2 + l] = (codes[j + l] & 0x0f) | (codes[j + l + 32] << 4);
+    }
+  }
+  qs
+}
+
+/// Q4_K nibbles in weight order, 128 bytes per 256 weights.
+pub(crate) fn q4k_packed(block: &[u8; 144]) -> [u8; 128] {
+  let qs: &[u8; 128] = block[16..].try_into().unwrap();
+  let codes = q4k_codes(qs);
+  let mut out = [0u8; 128];
+  for (i, code) in codes.into_iter().enumerate() {
+    out[i / 2] |= code << ((i % 2) * 4);
+  }
+  out
+}
+
+/// Superblock f16 scale and minimum, then the eight decoded scales and eight decoded minimums.
+pub(crate) fn q4k_scales(block: &[u8; 144]) -> [u8; 20] {
+  let mut out = [0u8; 20];
+  out[..4].copy_from_slice(&block[..4]);
+  let scales: &[u8; 12] = block[4..16].try_into().unwrap();
+  for j in 0..8 {
+    let (scale, min) = scale_min_k4(scales, j);
+    out[4 + j] = scale;
+    out[12 + j] = min;
+  }
+  out
 }
 
 /// Largest-magnitude element of a block, the first one when two tie.
@@ -271,6 +357,66 @@ pub(crate) fn quantize_q5_1(w: &[f32]) -> Vec<u8> {
     out.extend(f16::from_f32(min).to_le_bytes());
     out.extend(qh.to_le_bytes());
     out.extend(qs);
+  }
+  out
+}
+
+/// ggml Q4_K over `w`, whose length is a multiple of 256. Each group of 32 is an affine 4-bit
+/// grid whose scale and minimum are then quantized to 6 bits against the largest in the block of
+/// 256. A positive group minimum is pulled down to 0, so the stored minimum stays non-negative.
+#[cfg(test)]
+pub(crate) fn quantize_q4_k(w: &[f32]) -> Vec<u8> {
+  debug_assert!(w.len().is_multiple_of(256));
+  let mut out = Vec::with_capacity(w.len() / 256 * 144);
+  for block in w.as_chunks::<256>().0 {
+    let mut group_scale = [0f32; 8];
+    let mut group_min = [0f32; 8];
+    for j in 0..8 {
+      let sub = &block[j * 32..j * 32 + 32];
+      let (mut min, mut max) = (sub[0], sub[0]);
+      for &x in &sub[1..] {
+        if x < min {
+          min = x;
+        }
+        if x > max {
+          max = x;
+        }
+      }
+      if min > 0.0 {
+        min = 0.0;
+      }
+      group_scale[j] = if max == min { 0.0 } else { (max - min) / 15.0 };
+      group_min[j] = -min;
+    }
+    let max_scale = group_scale.into_iter().fold(0.0, f32::max);
+    let max_min = group_min.into_iter().fold(0.0, f32::max);
+    let d = f16::from_f32(if max_scale > 0.0 { max_scale / 63.0 } else { 0.0 });
+    let dmin = f16::from_f32(if max_min > 0.0 { max_min / 63.0 } else { 0.0 });
+    let (d_s, m_s) = (d.to_f32(), dmin.to_f32());
+    let q6 = |x: f32| (x + 0.5).trunc().clamp(0.0, 63.0) as u8;
+    let mut scale = [0u8; 8];
+    let mut min = [0u8; 8];
+    for j in 0..8 {
+      scale[j] = if d_s == 0.0 { 0 } else { q6(group_scale[j] / d_s) };
+      min[j] = if m_s == 0.0 { 0 } else { q6(group_min[j] / m_s) };
+    }
+    let mut codes = [0u8; 256];
+    for j in 0..8 {
+      let dq = d_s * scale[j] as f32;
+      if dq == 0.0 {
+        continue;
+      }
+      let dm = m_s * min[j] as f32;
+      let id = 1.0 / dq;
+      for l in 0..32 {
+        let x = block[j * 32 + l];
+        codes[j * 32 + l] = ((x + dm) * id + 0.5).trunc().clamp(0.0, 15.0) as u8;
+      }
+    }
+    out.extend(d.to_le_bytes());
+    out.extend(dmin.to_le_bytes());
+    out.extend(pack_scales_k4(&scale, &min));
+    out.extend(pack_qs_k4(&codes));
   }
   out
 }
@@ -410,7 +556,11 @@ impl Gguf {
     };
     g.data = end.next_multiple_of(align);
     for (name, t) in &g.tensors {
-      if g.data + t.offset + t.ty.size(t.dims.iter().product()) > len {
+      let n = t.dims.iter().product::<usize>();
+      if t.ty == Type::Q4_K && !n.is_multiple_of(256) {
+        bail!("tensor {name}: Q4_K has {n} weights, not a multiple of 256");
+      }
+      if g.data + t.offset + t.ty.size(n) > len {
         bail!("tensor {name} is out of file bounds");
       }
     }
@@ -548,6 +698,20 @@ impl Tensor<'_> {
           q5_1_codes(block).into_iter().map(move |c| c as f32 * d + m)
         })
         .collect(),
+      Type::Q4_K => (b.as_chunks::<144>().0.iter())
+        .flat_map(|block| {
+          let d = f16::from_le_bytes([block[0], block[1]]).to_f32();
+          let min = f16::from_le_bytes([block[2], block[3]]).to_f32();
+          let scales: &[u8; 12] = block[4..16].try_into().unwrap();
+          let qs: &[u8; 128] = block[16..].try_into().unwrap();
+          let codes = q4k_codes(qs);
+          (0..8).flat_map(move |j| {
+            let (scale, m) = scale_min_k4(scales, j);
+            let (d1, m1) = (d * scale as f32, min * m as f32);
+            (0..32).map(move |l| d1 * codes[j * 32 + l] as f32 - m1)
+          })
+        })
+        .collect(),
     })
   }
 }
@@ -565,12 +729,115 @@ pub(crate) struct Q5Write {
   pub dst_bytes: u64,
 }
 
+/// Q8_0 tensors rewritten by [`write_q4_k`].
+#[cfg(test)]
+pub(crate) struct Q4Write {
+  /// Tensors stored as Q4_K.
+  pub q4: usize,
+  /// Weights in those tensors.
+  pub q4_elements: usize,
+  /// Tensors stored as Q5_0.
+  pub q5: usize,
+  /// Weights in those tensors.
+  pub q5_elements: usize,
+  /// Bytes of the source file.
+  pub src_bytes: u64,
+  /// Bytes of the written file.
+  pub dst_bytes: u64,
+}
+
 /// Writes `src` to `dst`, re-quantizing each Q8_0 tensor to Q5_0 when its row length
 /// (`len / dims.last()`) is a multiple of 32. The codes are round-to-nearest on the dequantized
 /// Q8_0 values. Other tensors are copied. Metadata is copied; a `general.file_type` of 7 (mostly
 /// Q8_0) becomes 8 (mostly Q5_0).
 #[cfg(test)]
 pub(crate) fn write_q5_0(src: &Path, dst: &Path) -> Result<Q5Write> {
+  let wrote = rewrite(
+    src,
+    dst,
+    |_, dims| {
+      let row = row_len(dims);
+      (row >= 32 && row.is_multiple_of(32)).then_some(Type::Q5_0)
+    },
+    Label::Q5,
+  )?;
+  Ok(Q5Write {
+    converted: wrote.converted,
+    elements: wrote.elements,
+    src_bytes: wrote.src_bytes,
+    dst_bytes: wrote.dst_bytes,
+  })
+}
+
+/// Writes `src` to `dst`. A Q8_0 tensor whose row length is a multiple of 32 becomes Q4_K when
+/// it holds a multiple of 256 weights and `q5` returns false. It becomes Q5_0 when `q5` returns
+/// true, and when the count is not a multiple of 256. Blocks cover the flat tensor. The
+/// contiguous axis does not have to be a multiple of 256. The codes are round-to-nearest on the
+/// dequantized Q8_0 values. Other tensors are copied. A `general.file_type` of 7 becomes 14 when
+/// every converted tensor is Q4_K, and 15 when any is Q5_0.
+#[cfg(test)]
+pub(crate) fn write_q4_k(src: &Path, dst: &Path, q5: impl Fn(&str) -> bool) -> Result<Q4Write> {
+  let wrote = rewrite(
+    src,
+    dst,
+    |name, dims| {
+      let row = row_len(dims);
+      if row < 32 || !row.is_multiple_of(32) {
+        return None;
+      }
+      let n = dims.iter().product::<usize>();
+      if q5(name) || !n.is_multiple_of(256) { Some(Type::Q5_0) } else { Some(Type::Q4_K) }
+    },
+    Label::Q4,
+  )?;
+  Ok(Q4Write {
+    q4: wrote.q4,
+    q4_elements: wrote.q4_elements,
+    q5: wrote.q5,
+    q5_elements: wrote.q5_elements,
+    src_bytes: wrote.src_bytes,
+    dst_bytes: wrote.dst_bytes,
+  })
+}
+
+#[cfg(test)]
+fn row_len(dims: &[usize]) -> usize {
+  let n = dims.iter().product::<usize>();
+  match dims.last() {
+    Some(&d) if d > 0 => n / d,
+    _ => 0,
+  }
+}
+
+/// What a `general.file_type` of 7 is rewritten to.
+#[cfg(test)]
+enum Label {
+  /// Mostly Q5_0, file type 8.
+  Q5,
+  /// Mostly Q4_K. File type 14 when every converted tensor is Q4_K, 15 when any is Q5_0.
+  Q4,
+}
+
+#[cfg(test)]
+struct Rewritten {
+  converted: usize,
+  elements: usize,
+  q4: usize,
+  q4_elements: usize,
+  q5: usize,
+  q5_elements: usize,
+  src_bytes: u64,
+  dst_bytes: u64,
+}
+
+/// Copies `src` to `dst`. `pick` chooses a new type for each Q8_0 tensor, or `None` to copy it.
+#[cfg(test)]
+fn rewrite(
+  src: &Path,
+  dst: &Path,
+  pick: impl Fn(&str, &[usize]) -> Option<Type>,
+  label: Label,
+) -> Result<Rewritten> {
   use std::io::Write;
 
   let src_bytes = std::fs::metadata(src)?.len();
@@ -604,6 +871,10 @@ pub(crate) fn write_q5_0(src: &Path, dst: &Path) -> Result<Q5Write> {
 
   let mut converted = 0;
   let mut elements = 0;
+  let mut q4 = 0;
+  let mut q4_elements = 0;
+  let mut q5 = 0;
+  let mut q5_elements = 0;
   let mut tensors = Vec::with_capacity(n_tensors);
   for _ in 0..n_tensors {
     let name = r.string()?;
@@ -613,15 +884,28 @@ pub(crate) fn write_q5_0(src: &Path, dst: &Path) -> Result<Q5Write> {
     let Some(ty) = Type::from_ggml(id) else { bail!("tensor {name}: unsupported ggml type {id}") };
     _ = r.u64()?;
     let n = dims.iter().product::<usize>();
-    let row = match dims.last() {
-      Some(&d) if d > 0 => n / d,
-      _ => 0,
-    };
+    let row = row_len(&dims);
     let tensor = g.tensor(&name, &dims)?;
-    let (ty, bytes) = if ty == Type::Q8_0 && row >= 32 && row.is_multiple_of(32) {
+    let dest = if ty == Type::Q8_0 { pick(&name, &dims) } else { None };
+    let (ty, bytes) = if let Some(dest) = dest {
+      let values = tensor.to_f32()?;
+      let row_ok = row >= 32 && row.is_multiple_of(32);
+      let bytes = match dest {
+        Type::Q5_0 if row_ok => {
+          q5 += 1;
+          q5_elements += n;
+          quantize_q5_0(&values)
+        }
+        Type::Q4_K if row_ok && n.is_multiple_of(256) => {
+          q4 += 1;
+          q4_elements += n;
+          quantize_q4_k(&values)
+        }
+        other => bail!("tensor {name}: {n} weights cannot be stored as {other:?}"),
+      };
       converted += 1;
       elements += n;
-      (Type::Q5_0, quantize_q5_0(&tensor.to_f32()?))
+      (dest, bytes)
     } else {
       let mut bytes = vec![0u8; ty.size(n)];
       if !bytes.is_empty() {
@@ -649,7 +933,15 @@ pub(crate) fn write_q5_0(src: &Path, dst: &Path) -> Result<Q5Write> {
     .collect();
 
   let mut header = g.head[..meta_end].to_vec();
-  if let Some((pos, ty)) = file_type {
+  let replacement = match label {
+    Label::Q5 => Some(8u64),
+    Label::Q4 if q5 > 0 => Some(15),
+    Label::Q4 if q4 > 0 => Some(14),
+    Label::Q4 => None,
+  };
+  if let Some(id) = replacement
+    && let Some((pos, ty)) = file_type
+  {
     let width = if ty == 10 || ty == 11 { 8 } else { 4 };
     let cur = if width == 8 {
       u64::from_le_bytes(header[pos..pos + 8].try_into().unwrap())
@@ -657,7 +949,7 @@ pub(crate) fn write_q5_0(src: &Path, dst: &Path) -> Result<Q5Write> {
       u32::from_le_bytes(header[pos..pos + 4].try_into().unwrap()) as u64
     };
     if cur == 7 {
-      header[pos..pos + width].copy_from_slice(&8u64.to_le_bytes()[..width]);
+      header[pos..pos + width].copy_from_slice(&id.to_le_bytes()[..width]);
     }
   }
   for (name, dims, ty, at, _) in &placed {
@@ -684,7 +976,16 @@ pub(crate) fn write_q5_0(src: &Path, dst: &Path) -> Result<Q5Write> {
     cursor = at + bytes.len();
   }
   file.flush()?;
-  Ok(Q5Write { converted, elements, src_bytes, dst_bytes: (header.len() + cursor) as u64 })
+  Ok(Rewritten {
+    converted,
+    elements,
+    q4,
+    q4_elements,
+    q5,
+    q5_elements,
+    src_bytes,
+    dst_bytes: (header.len() + cursor) as u64,
+  })
 }
 
 /// ggml type id of `ty`.
@@ -698,6 +999,7 @@ fn ggml_id(ty: Type) -> u32 {
     Type::Q5_0 => 6,
     Type::Q5_1 => 7,
     Type::Q8_0 => 8,
+    Type::Q4_K => 12,
   }
 }
 
@@ -1188,6 +1490,142 @@ mod tests {
     assert_eq!(g.tensor("bias", &[2]).unwrap().to_f32().unwrap(), floats);
     std::fs::remove_file(src).unwrap();
     std::fs::remove_file(dst).unwrap();
+  }
+
+  /// Eight Q8_0 rows on the −16..15 grid become one Q4_K block. A tensor named in `q5` stays
+  /// Q5_0, a 64-weight tensor is too short for Q4_K and stays Q5_0, a one-dimensional block is
+  /// copied, and an F32 tensor is copied. `general.file_type` 7 becomes 15 for that mix and 14
+  /// when every converted tensor is Q4_K.
+  #[test]
+  fn write_q4_k_repacks_blocks() {
+    let grid: [i8; 32] = std::array::from_fn(|i| i as i8 - 16);
+    let mut q8 = [0u8; 34];
+    q8[..2].copy_from_slice(&f16::from_f32(1.0).to_le_bytes());
+    for (i, v) in grid.iter().enumerate() {
+      q8[2 + i] = *v as u8;
+    }
+    let weights = q8.repeat(8);
+    let tail = q8.repeat(2);
+    let floats = [1.5f32, -2.0];
+    let values = |n: usize| grid.iter().map(|&v| v as f32).cycle().take(n).collect::<Vec<_>>();
+    let dequant = |ty: Type, dims: &[usize], bytes: &[u8]| {
+      Gguf::with_tensors(&[("t", dims, ty, bytes)]).tensor("t", dims).unwrap().to_f32().unwrap()
+    };
+    let q4 = dequant(Type::Q4_K, &[32, 8], &quantize_q4_k(&values(256)));
+    let q5_wide = dequant(Type::Q5_0, &[32, 8], &quantize_q5_0(&values(256)));
+    let q5_tail = dequant(Type::Q5_0, &[32, 2], &quantize_q5_0(&values(64)));
+
+    let build = |parts: &[(&str, &[u64], u32, &[u8])]| {
+      let mut data = Vec::new();
+      let mut placed = Vec::new();
+      for (name, dims, ty, bytes) in parts {
+        let at = data.len().next_multiple_of(32);
+        data.resize(at, 0);
+        placed.push((*name, *dims, *ty, at as u64));
+        data.extend(*bytes);
+      }
+      let mut f = b"GGUF".to_vec();
+      f.extend(3u32.to_le_bytes());
+      f.extend((parts.len() as u64).to_le_bytes());
+      f.extend(1u64.to_le_bytes());
+      string(&mut f, "general.file_type");
+      f.extend(4u32.to_le_bytes());
+      f.extend(7u32.to_le_bytes());
+      for (name, dims, ty, at) in placed {
+        string(&mut f, name);
+        f.extend((dims.len() as u32).to_le_bytes());
+        for d in dims {
+          f.extend(d.to_le_bytes());
+        }
+        f.extend(ty.to_le_bytes());
+        f.extend(at.to_le_bytes());
+      }
+      f.resize(f.len().next_multiple_of(32), 0);
+      f.extend(data);
+      f
+    };
+    let open = |bytes: &[u8], tag: &str, q5: fn(&str) -> bool| {
+      let dir = std::env::temp_dir();
+      let src = dir.join(format!("wavo-q4-src-{tag}-{}", std::process::id()));
+      let dst = dir.join(format!("wavo-q4-dst-{tag}-{}", std::process::id()));
+      std::fs::write(&src, bytes).unwrap();
+      let wrote = write_q4_k(&src, &dst, q5).unwrap();
+      let g = Gguf::open(&dst).unwrap();
+      assert_eq!(wrote.src_bytes, std::fs::metadata(&src).unwrap().len());
+      assert_eq!(wrote.dst_bytes, std::fs::metadata(&dst).unwrap().len());
+      assert!(wrote.dst_bytes < wrote.src_bytes);
+      std::fs::remove_file(src).unwrap();
+      std::fs::remove_file(dst).unwrap();
+      (wrote, g)
+    };
+
+    let mixed = build(&[
+      ("narrow", &[32, 8], 8, &weights),
+      ("wide", &[32, 8], 8, &weights),
+      ("tail", &[32, 2], 8, &tail),
+      ("kept", &[32], 8, &q8),
+      ("bias", &[2], 0, &floats.iter().flat_map(|v| v.to_le_bytes()).collect::<Vec<_>>()),
+    ]);
+    let (wrote, g) = open(&mixed, "mix", |name| name == "wide");
+    assert_eq!((wrote.q4, wrote.q4_elements), (1, 256));
+    assert_eq!((wrote.q5, wrote.q5_elements), (2, 256 + 64));
+    assert_eq!(g.get::<u32>("general.file_type").unwrap(), 15);
+    assert_eq!(g.tensor("narrow", &[32, 8]).unwrap().ty, Type::Q4_K);
+    assert_eq!(g.tensor("narrow", &[32, 8]).unwrap().to_f32().unwrap(), q4);
+    assert_eq!(g.tensor("wide", &[32, 8]).unwrap().ty, Type::Q5_0);
+    assert_eq!(g.tensor("wide", &[32, 8]).unwrap().to_f32().unwrap(), q5_wide);
+    assert_eq!(g.tensor("tail", &[32, 2]).unwrap().ty, Type::Q5_0);
+    assert_eq!(g.tensor("tail", &[32, 2]).unwrap().to_f32().unwrap(), q5_tail);
+    assert_eq!(g.tensor("kept", &[32]).unwrap().ty, Type::Q8_0);
+    assert_eq!(g.tensor("kept", &[32]).unwrap().to_f32().unwrap(), values(32));
+    assert_eq!(g.tensor("bias", &[2]).unwrap().to_f32().unwrap(), floats);
+
+    let only = build(&[("narrow", &[32, 8], 8, &weights)]);
+    let (wrote, g) = open(&only, "q4", |_| false);
+    assert_eq!((wrote.q4, wrote.q5), (1, 0));
+    assert_eq!(g.get::<u32>("general.file_type").unwrap(), 14);
+    assert_eq!(g.tensor("narrow", &[32, 8]).unwrap().ty, Type::Q4_K);
+  }
+
+  #[test]
+  fn q4_k_round_trips() {
+    let scale = [1u8, 2, 3, 4, 5, 6, 7, 8];
+    let min = [0u8, 1, 0, 1, 0, 1, 0, 1];
+    let codes = std::array::from_fn(|i| (i % 16) as u8);
+    let mut block = [0u8; 144];
+    block[..2].copy_from_slice(&f16::from_f32(0.5).to_le_bytes());
+    block[2..4].copy_from_slice(&f16::from_f32(0.25).to_le_bytes());
+    block[4..16].copy_from_slice(&pack_scales_k4(&scale, &min));
+    block[16..].copy_from_slice(&pack_qs_k4(&codes));
+    for j in 0..8 {
+      assert_eq!(scale_min_k4(block[4..16].try_into().unwrap(), j), (scale[j], min[j]));
+    }
+    let scales = q4k_scales(&block);
+    assert_eq!(&scales[4..12], &scale);
+    assert_eq!(&scales[12..20], &min);
+    let packed = q4k_packed(&block);
+    for group in 0..64 {
+      let local = group * 4;
+      let word = u32::from_le_bytes(packed[local / 8 * 4..][..4].try_into().unwrap());
+      let bits = (word >> ((local % 8) * 4)) & 0xffff;
+      let got = [
+        (bits & 15) as u8,
+        ((bits >> 4) & 15) as u8,
+        ((bits >> 8) & 15) as u8,
+        ((bits >> 12) & 15) as u8,
+      ];
+      assert_eq!(got, codes[local..local + 4]);
+    }
+    let g = Gguf::with_tensors(&[("q", &[256], Type::Q4_K, &block)]);
+    let expected: Vec<f32> = (0..256)
+      .map(|i| 0.5 * scale[i / 32] as f32 * codes[i] as f32 - 0.25 * min[i / 32] as f32)
+      .collect();
+    assert_eq!(g.tensor("q", &[256]).unwrap().to_f32().unwrap(), expected);
+
+    let zeros = quantize_q4_k(&[0.0; 256]);
+    assert_eq!(zeros, vec![0u8; 144]);
+    let g = Gguf::with_tensors(&[("z", &[256], Type::Q4_K, &zeros)]);
+    assert_eq!(g.tensor("z", &[256]).unwrap().to_f32().unwrap(), vec![0.0; 256]);
   }
 
   #[test]

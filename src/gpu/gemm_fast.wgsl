@@ -120,6 +120,31 @@ fn q51_4(x: u32) -> vec4<f32> {
   return q5_codes4(x) * s.x + s.y;
 }
 
+// Same Q4_K load as gemm.wgsl. This module is not concatenated with that one.
+fn q4k_codes4(x: u32) -> vec4<f32> {
+  let block = x / 256u;
+  let local = x % 256u;
+  let word = w[block * 32u + local / 8u];
+  let bits = (word >> ((local % 8u) * 4u)) & 0xFFFFu;
+  return vec4(f32(bits & 15u), f32((bits >> 4u) & 15u), f32((bits >> 8u) & 15u), f32((bits >> 12u) & 15u));
+}
+
+fn q4k_dm(x: u32) -> vec2<f32> {
+  let block = x / 256u;
+  let sub = (x % 256u) / 32u;
+  let base = block * 5u;
+  let hd = unpack2x16float(scales[base]);
+  let shift = (sub % 4u) * 8u;
+  let scale = (scales[base + 1u + sub / 4u] >> shift) & 255u;
+  let min = (scales[base + 3u + sub / 4u] >> shift) & 255u;
+  return vec2(hd.x * f32(scale), hd.y * f32(min));
+}
+
+fn q4k_4(x: u32) -> vec4<f32> {
+  let s = q4k_dm(x);
+  return q4k_codes4(x) * s.x - s.y;
+}
+
 fn src_stride() -> u32 {
   return select(p.k, p.src_k, p.src_k != 0u);
 }
@@ -215,6 +240,7 @@ fn stage_w(n0: u32, k0: u32, i: u32) {
       case 4u: { v = q4_at(n0 + r, k0 + kk); }
       case 5u: { v = q41_at(n0 + r, k0 + kk); }
       case 6u: { v = q51_at(n0 + r, k0 + kk); }
+      case 7u: { v = q4k_4(x); }
       default: { v = vec4<f32>(unpack4xI8(w[x / 4u])) * scale(x / 32u); }
     }
   }
