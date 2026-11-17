@@ -198,6 +198,10 @@ two numbers (A/B/A, warm median unless stated), kept or rejected and why.
 
 ### GEMM
 
+- 2026-11-17, GigaAM v3 e2e-rnnt and Parakeet TDT 0.6b v3, Q8_0, portable kernels, RADV Mesa 26.3.0, RX 5700 XT (Navi 10). `wavo bench -n 1 --profile`, `WGPU_ADAPTER_NAME=5700`. Call 2 matches call 1 within a few tenths of a millisecond. Kernels (GEMM, attention, other): `ru` 38.0 ms (37.0, 0.5, 0.5), Q8 GEMM 31.5 ms, 83%; `ru-long` 115.8 (101.5, 12.3, 2.0), Q8 86.6, 75%, flash 12.3; `jfk` 91.2 (87.3, 2.5, 1.4), Q8 75.7, 83%; `dots` 180.9 (154.5, 22.4, 4.0), Q8 133.9, 74%, relative attention 22.4. Q8 GEMM is 74–83% of kernel time.
+  - 32-row tiles (`WAVO_KERNELS=portable-32`), same four profiles, call 2 Q8: `ru` 27.8 (−12%), `jfk` 67.0 (−11%), `ru-long` 111.4 (+29%), `dots` 166.6 (+24%). Short clips get faster. The long GEMMs, most of the time, get slower. Rejected.
+  - Column quads in the portable GEMM: 64 consecutive threads share 8 quads, so a vec4 load uses each of the 32 shared-memory banks once. `lid % 16` put 16 quads in that group, and quads 8 apart landed on the same banks. A/B/A of call 2 Q8, the two A runs within 0.5%: `ru` 31.6 / 30.7 / 31.6, `ru-long` 86.5 / 84.1 / 86.4, `jfk` 75.7 / 73.7 / 75.4, `dots` 134.3 / 132.1 / 134.6 ms. f16 GEMM on `ru-long` and `dots` moved under 1%. The GEMM unit test passes. Unprofiled `-n 10` medians are not recorded: the two A runs on `jfk` and `dots` differed by more than 3%. Kept.
+
 - 2026-11-07, all models, the portable GEMM rounds `a` to f16 as `kernel_mul_mm` does (PR #88):
   without it ivrit he-long gave `החללה` where the fixture has `החלאה`, a near-tie. This reverses
   the rejection of rounding `a` in the 2026-10-09 entry on rounding W below, now that a fixture
