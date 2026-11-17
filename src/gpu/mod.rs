@@ -374,7 +374,7 @@ struct Portable {
   gemm: Vec<Pipeline>,
   /// Columns and rows of the GEMM's tile: 128 × 32 on the 16×16 tier, whose GEMMs that come here
   /// are too small for its tiles and run faster with more workgroups, 64 × 64 on a CPU adapter
-  /// (`gemm_cpu.wgsl`), else 128 × 64.
+  /// (`gemm_cpu.wgsl`), else 64 × 64 in `gemm` (`COLS`).
   gemm_tile: [usize; 2],
   layer_norm: Pipeline,
   im2col: Pipeline,
@@ -399,8 +399,7 @@ struct Portable {
 }
 
 impl Portable {
-  fn new(device: &wgpu::Device, gemm_tile: [usize; 2]) -> Self {
-    let cpu = gemm_tile[0] == 64;
+  fn new(device: &wgpu::Device, gemm_tile: [usize; 2], cpu: bool) -> Self {
     let gemm = match cpu {
       true => module(device, &[include_str!("gemm.wgsl"), include_str!("gemm_cpu.wgsl")].concat()),
       false => module(device, include_str!("gemm.wgsl")),
@@ -413,7 +412,13 @@ impl Portable {
         .map(|ty| match cpu {
           true => pipeline(device, &gemm, "gemm64", &[("WTYPE", ty as f64)]),
           false => {
-            let constants = [("WTYPE", ty as f64), ("ROWS", gemm_tile[1] as f64)];
+            let constants = [
+              ("WTYPE", ty as f64),
+              ("ROWS", gemm_tile[1] as f64),
+              ("COLS", gemm_tile[0] as f64),
+              // 32 k-steps by COLS/4 column quads.
+              ("WT", (gemm_tile[0] * 8) as f64),
+            ];
             pipeline(device, &gemm, "gemm", &constants)
           }
         })
@@ -652,13 +657,15 @@ impl Gpu {
         let fast = size.and_then(|f| compile_fast(&device, f));
         (fast, if tensor { compile_tensor(&device) } else { None })
       });
-      let tile = match (forced, size, cpu) {
-        (Some(Forced::Portable(tile)), ..) => tile,
-        (_, _, true) => [64, 64],
-        (_, Some(16), _) => [128, 32],
-        _ => [128, 64],
+      // `portable-cpu` is the only forced [64, 64], and it is the CPU shader. The unforced
+      // portable tile is also 64×64, in `gemm`, so width alone cannot select `gemm64`.
+      let (tile, cpu_shader) = match (forced, size, cpu) {
+        (Some(Forced::Portable(tile)), ..) => (tile, tile == [64, 64]),
+        (_, _, true) => ([64, 64], true),
+        (_, Some(16), _) => ([128, 32], false),
+        _ => ([64, 64], false),
       };
-      (Portable::new(&device, tile), compiled.join().unwrap())
+      (Portable::new(&device, tile, cpu_shader), compiled.join().unwrap())
     });
     let weights = wgpu::BufferUsages::STORAGE
       | if mappable { wgpu::BufferUsages::MAP_WRITE } else { wgpu::BufferUsages::COPY_DST };
