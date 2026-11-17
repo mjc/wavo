@@ -288,7 +288,7 @@ use std::path::Path;
 use ane::Target;
 use error::bail;
 pub use error::{Error, Result};
-pub use gpu::{Api, Device, DeviceKind, Kernels};
+pub use gpu::{Api, Device, DeviceKind, Kernels, profile_dispatches};
 pub use speakers::{Turn, Utterance};
 pub use split::split;
 

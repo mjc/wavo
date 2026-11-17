@@ -198,6 +198,12 @@ two numbers (A/B/A, warm median unless stated), kept or rejected and why.
 
 ### GEMM
 
+- 2026-11-17, GigaAM v3 e2e-rnnt and Parakeet TDT 0.6b v3, Q8_0, portable kernels, RADV Mesa 26.3.0, RX 5700 XT (Navi 10). `wavo bench -n 1 --profile`, `WGPU_ADAPTER_NAME=5700`. An adapter whose name contains `RADV NAVI10` gets a second Vulkan instance with `cswave32` appended to `RADV_PERFTEST`. RADV reads that variable in `vkCreateInstance` and stores the compute wave size on the physical device. The previous value is restored before the device is used, so a later adapter keeps the wave size RADV would have picked. Call 2 Q8, A/B/A against the bank-mapped build, the two A runs within 0.3%: `ru` 30.7 / 28.2 / 30.6 (−8.0%), `ru-long` 83.9 / 76.6 / 84.1 (−8.8%), `jfk` 73.8 / 68.4 / 73.9 (−7.4%), `dots` 131.9 / 122.5 / 131.8 (−7.1%). With the flag set in the environment on the bank-mapped build, the Q8 shader's subgroup size is 32. The `v_mac_f32` and `ds_read_b64` counts in that shader stay the same, and it has no `ds_read_b128`. LayerNorm on `ru-long` went from 1.42 ms to 1.88 ms; total kernel time still fell (`ru-long` 113.0 / 104.1 / 113.1). e2e-ctc on `ru`, `ru-short` and `ru-long`, and ivrit `he-short` and `he-long`, matched their fixtures. Kept.
+
+- 2026-11-17, GigaAM v3 e2e-rnnt and Parakeet TDT 0.6b v3, Q8_0, portable kernels, RADV Mesa 26.3.0, RX 5700 XT (Navi 10). `wavo bench -n 1 --profile`, `WGPU_ADAPTER_NAME=5700`. Call 2 matches call 1 within a few tenths of a millisecond. Kernels (GEMM, attention, other): `ru` 38.0 ms (37.0, 0.5, 0.5), Q8 GEMM 31.5 ms, 83%; `ru-long` 115.8 (101.5, 12.3, 2.0), Q8 86.6, 75%, flash 12.3; `jfk` 91.2 (87.3, 2.5, 1.4), Q8 75.7, 83%; `dots` 180.9 (154.5, 22.4, 4.0), Q8 133.9, 74%, relative attention 22.4. Q8 GEMM is 74–83% of kernel time.
+  - 32-row tiles (`WAVO_KERNELS=portable-32`), same four profiles, call 2 Q8: `ru` 27.8 (−12%), `jfk` 67.0 (−11%), `ru-long` 111.4 (+29%), `dots` 166.6 (+24%). Short clips get faster. The long GEMMs, most of the time, get slower. Rejected.
+  - Column quads in the portable GEMM: 64 consecutive threads share 8 quads, so a vec4 load uses each of the 32 shared-memory banks once. `lid % 16` put 16 quads in that group, and quads 8 apart landed on the same banks. A/B/A of call 2 Q8, the two A runs within 0.5%: `ru` 31.6 / 30.7 / 31.6, `ru-long` 86.5 / 84.1 / 86.4, `jfk` 75.7 / 73.7 / 75.4, `dots` 134.3 / 132.1 / 134.6 ms. f16 GEMM on `ru-long` and `dots` moved under 1%. The GEMM unit test passes. Unprofiled `-n 10` medians are not recorded: the two A runs on `jfk` and `dots` differed by more than 3%. Kept.
+
 - 2026-11-07, all models, the portable GEMM rounds `a` to f16 as `kernel_mul_mm` does (PR #88):
   without it ivrit he-long gave `החללה` where the fixture has `החלאה`, a near-tie. This reverses
   the rejection of rounding `a` in the 2026-10-09 entry on rounding W below, now that a fixture
@@ -768,6 +774,28 @@ plus first call.
 ### Benchmarks and profiles
 
 Numbers are in the plans' "## Result" sections.
+
+- 2026-11-04, GigaAM v3 e2e-rnnt and Parakeet TDT 0.6b v3, Q8_0, portable kernels, RADV Mesa 26.2.6.
+  The default adapter is a Radeon RX 5700 XT (Navi 10), with no cooperative
+  matrices. The Radeon 760M (Phoenix) reports 16×16×16 f16→f16 and f16→f32 and still runs
+  portable: the 16×16 tier stays on NVIDIA's vendor id (2026-10-11). `wavo bench -n 10`,
+  `WGPU_ADAPTER_NAME` `5700` then `760M`, one run of 10 warm calls. Warm min is within 1% of the
+  median. 5700 XT median / min: GigaAM `ru` 41.5 / 41.1, `ru-long` 146.8 / 146.2, Parakeet `jfk`
+  106.8 / 105.9, `dots` 261.5 / 260.4 ms. 760M: 52.7 / 52.1, 346.5 / 344.3, 197.4 / 195.7, 583.0 /
+  581.4 ms. Load 73–135 ms, apart from two 760M Parakeet loads at 378 and 578 ms.
+  `wavo bench -n 1 --profile` times each dispatch in its own pass. The span runs a few percent
+  above the kernel sum, and that sum is not the span of a normal submission. On the 5700 XT, call
+  1 and call 2 agree within 0.2%. Call 2, 278 dispatches for GigaAM and 437 for Parakeet, kernels
+  (GEMM, attention, other): `ru` 34.4 ms (33.4, 0.5, 0.5), Q8 GEMM 29.2 ms, 85%; `ru-long` 111.0
+  (96.6, 12.3, 2.0), Q8 83.2, 75%, flash 12.3; `jfk` 83.3 (79.3, 2.6, 1.4), Q8 69.1, 83%; `dots`
+  171.3 (144.8, 22.5, 3.9), Q8 128.0, 75%, relative attention 22.5. The unprofiled medians sit
+  about 7, 36, 24 and 90 ms above those sums, in that clip order. On the 760M the first profiled
+  call was slower for `ru-long` (363 vs 313 ms of kernels) and `jfk` (233 vs 174); `dots` stayed
+  near 490 (call 2: 491.5, GEMM 436.2, attention 40.3, other 14.9). Call 2 on `ru-long` is 313.4
+  (263.5, 40.6, 9.2) and on `jfk` 174.2 (164.7, 5.7, 3.8). Q8 GEMM is 70–81% of every 760M kernel
+  sum. The short `ru` profile stayed near 100 ms of kernels (call 2 wall 111.6) against the warm
+  median of 52.7, so that breakdown is not the warm GPU. `layer_norm` and `conv_glu` stay around
+  1–3% beside the Q8 GEMM.
 
 - 2026-10-12, Whisper turbo decoder on the RTX 4060, `ru-long` (117 steps), after the decoder
   entries of that day (GPU timestamps, each dispatch in its own pass): per token the gemvs 0.74
