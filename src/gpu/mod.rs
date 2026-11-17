@@ -3,6 +3,8 @@
 //! Each kernel has a portable version; a fast one (subgroups, cooperative matrices) replaces it
 //! when the device supports it and a probe dispatch of that pipeline succeeds.
 
+use std::cell::Cell;
+use std::ffi::OsString;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock, PoisonError, mpsc};
 
@@ -14,6 +16,13 @@ use crate::gguf::{Tensor, Type};
 
 /// Set before [`crate::Model::load`] so each later dispatch is timed.
 static PROFILE: AtomicBool = AtomicBool::new(false);
+
+/// Serializes Vulkan instance creation with the temporary `RADV_PERFTEST` change below.
+static RADV_INSTANCE: Mutex<()> = Mutex::new(());
+
+thread_local! {
+  static RADV_INSTANCE_HELD: Cell<bool> = const { Cell::new(false) };
+}
 
 /// Time each GPU dispatch of models loaded after this call.
 ///
@@ -171,7 +180,32 @@ fn adapters(upto: usize) -> Result<Vec<wgpu::Adapter>> {
 }
 
 /// The adapter at `index` of [`devices`], else the one `adapter()` picks.
+///
+/// RADV on Navi 10 (`RADV NAVI10` in the device name) runs the portable GEMM faster with 32-wide
+/// compute waves. It reads `RADV_PERFTEST` in `vkCreateInstance` and stores that wave size on the
+/// physical device, so the instance is created again with `cswave32` appended to the variable.
+/// The previous value is restored before this returns. A later adapter in the process keeps the
+/// wave size RADV picks on its own, and an existing `cswave32` is left as it was.
 fn adapter_at(index: Option<usize>) -> Result<wgpu::Adapter> {
+  with_radv_instance(|| {
+    let adapter = adapter_selected(index)?;
+    if !radv_compute_wave32(&adapter.get_info()) || radv_perftest_enabled("cswave32") {
+      return Ok(adapter);
+    }
+    drop(adapter);
+    let previous = std::env::var_os("RADV_PERFTEST");
+    // SAFETY: `set_var` races a C `getenv` on another thread. The probe instance is already
+    // dropped. This lock is held, and every Vulkan instance create in this module takes it.
+    // The compile thread starts only after the device exists, which is after the variable is
+    // restored. Rust `std::env` reads take the lock `set_var` holds. A `getenv` in another
+    // crate during this call would still race.
+    unsafe { std::env::set_var("RADV_PERFTEST", radv_perftest_with(&previous, "cswave32")) };
+    let _restore = RadvPerftestRestore { previous };
+    adapter_selected(index)
+  })
+}
+
+fn adapter_selected(index: Option<usize>) -> Result<wgpu::Adapter> {
   let i = match index {
     None | Some(0) => return adapter(),
     Some(i) => i,
@@ -183,6 +217,63 @@ fn adapter_at(index: Option<usize>) -> Result<wgpu::Adapter> {
   }
 
   Ok(all.swap_remove(i))
+}
+
+/// Whether `info` is RADV on Navi 10. Other RADV chips keep the driver's compute wave size.
+fn radv_compute_wave32(info: &wgpu::AdapterInfo) -> bool {
+  info.backend == wgpu::Backend::Vulkan && info.name.contains("RADV NAVI10")
+}
+
+fn radv_perftest_enabled(flag: &str) -> bool {
+  std::env::var_os("RADV_PERFTEST").is_some_and(|value| {
+    value.to_str().is_some_and(|text| text.split(',').any(|part| part == flag))
+  })
+}
+
+fn radv_perftest_with(previous: &Option<OsString>, flag: &str) -> OsString {
+  let mut value = previous.clone().unwrap_or_default();
+  if !value.is_empty() {
+    value.push(",");
+  }
+  value.push(flag);
+  value
+}
+
+fn with_radv_instance<T>(f: impl FnOnce() -> T) -> T {
+  if RADV_INSTANCE_HELD.with(Cell::get) {
+    return f();
+  }
+  let _guard = RADV_INSTANCE.lock().unwrap_or_else(PoisonError::into_inner);
+  RADV_INSTANCE_HELD.with(|held| held.set(true));
+  let _release = RadvInstanceHeld;
+  f()
+}
+
+/// Clears the thread-local held flag if `with_radv_instance` unwinds.
+struct RadvInstanceHeld;
+
+impl Drop for RadvInstanceHeld {
+  fn drop(&mut self) {
+    RADV_INSTANCE_HELD.with(|held| held.set(false));
+  }
+}
+
+/// Puts `RADV_PERFTEST` back after the Navi 10 instance has copied it.
+struct RadvPerftestRestore {
+  previous: Option<OsString>,
+}
+
+impl Drop for RadvPerftestRestore {
+  fn drop(&mut self) {
+    // SAFETY: same critical section as the `set_var` in `adapter_at`. This runs before that lock
+    // is released.
+    unsafe {
+      match self.previous.take() {
+        Some(value) => std::env::set_var("RADV_PERFTEST", value),
+        None => std::env::remove_var("RADV_PERFTEST"),
+      }
+    }
+  }
 }
 
 /// The kernels `adapter`'s features allow, before their probes.
@@ -1287,9 +1378,11 @@ fn picked() -> Result<(wgpu::Instance, wgpu::Adapter)> {
 
 /// An instance of `backends`, within those wgpu's `WGPU_*` variables allow.
 fn instance(backends: wgpu::Backends) -> wgpu::Instance {
-  let mut desc = wgpu::InstanceDescriptor::new_without_display_handle().with_env();
-  desc.backends &= backends;
-  wgpu::Instance::new(desc)
+  with_radv_instance(|| {
+    let mut desc = wgpu::InstanceDescriptor::new_without_display_handle().with_env();
+    desc.backends &= backends;
+    wgpu::Instance::new(desc)
+  })
 }
 
 /// F of the F×F cooperative matrices the fast kernels use on `adapter`, which needs 32-lane
@@ -2135,6 +2228,22 @@ mod tests {
     let none = Fast::default();
     assert!(Forced::Portable([128, 64]).kept(&none));
     assert!(!Forced::Matrix8.kept(&none) && !Forced::Tensor.kept(&none));
+  }
+
+  #[test]
+  fn navi10_compute_wave32() {
+    let mut info = wgpu::AdapterInfo::new(wgpu::DeviceType::DiscreteGpu, wgpu::Backend::Vulkan);
+    info.name = "AMD Radeon RX 5700 XT (RADV NAVI10)".into();
+    assert!(radv_compute_wave32(&info));
+    info.name = "AMD Radeon 760M Graphics (RADV PHOENIX)".into();
+    assert!(!radv_compute_wave32(&info));
+    info.backend = wgpu::Backend::Metal;
+    info.name = "AMD Radeon RX 5700 XT (RADV NAVI10)".into();
+    assert!(!radv_compute_wave32(&info));
+    let none: Option<std::ffi::OsString> = None;
+    assert_eq!(radv_perftest_with(&none, "cswave32"), "cswave32");
+    let previous = Some(std::ffi::OsString::from("sam"));
+    assert_eq!(radv_perftest_with(&previous, "cswave32"), "sam,cswave32");
   }
 
   #[test]
