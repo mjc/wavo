@@ -220,7 +220,8 @@ pub(crate) fn q4k_packed(block: &[u8; 144]) -> [u8; 128] {
 }
 
 /// Superblock f16 scale and minimum, then the eight decoded scales and eight decoded minimums.
-pub(crate) fn q4k_scales(block: &[u8; 144]) -> [u8; 20] {
+#[cfg(test)]
+fn q4k_scales(block: &[u8; 144]) -> [u8; 20] {
   let mut out = [0u8; 20];
   out[..4].copy_from_slice(&block[..4]);
   let scales: &[u8; 12] = block[4..16].try_into().unwrap();
@@ -228,6 +229,27 @@ pub(crate) fn q4k_scales(block: &[u8; 144]) -> [u8; 20] {
     let (scale, min) = scale_min_k4(scales, j);
     out[4 + j] = scale;
     out[12 + j] = min;
+  }
+  out
+}
+
+/// `(d · scale, dmin · min)` for each group of 32 in one Q4_K block.
+pub(crate) fn q4k_group_dm(block: &[u8; 144]) -> [(f32, f32); 8] {
+  let d = f16::from_le_bytes([block[0], block[1]]).to_f32();
+  let min = f16::from_le_bytes([block[2], block[3]]).to_f32();
+  let scales: &[u8; 12] = block[4..16].try_into().unwrap();
+  std::array::from_fn(|j| {
+    let (scale, m) = scale_min_k4(scales, j);
+    (d * scale as f32, min * m as f32)
+  })
+}
+
+/// [`q4k_group_dm`] as little-endian f32 pairs, 8 bytes per group, group order.
+pub(crate) fn q4k_dm_bytes(block: &[u8; 144]) -> [u8; 64] {
+  let mut out = [0u8; 64];
+  for (j, (d, m)) in q4k_group_dm(block).into_iter().enumerate() {
+    out[8 * j..8 * j + 4].copy_from_slice(&d.to_le_bytes());
+    out[8 * j + 4..8 * j + 8].copy_from_slice(&m.to_le_bytes());
   }
   out
 }
@@ -1774,6 +1796,12 @@ mod tests {
     let scales = q4k_scales(&block);
     assert_eq!(&scales[4..12], &scale);
     assert_eq!(&scales[12..20], &min);
+    let d = f16::from_le_bytes([block[0], block[1]]).to_f32();
+    let min_d = f16::from_le_bytes([block[2], block[3]]).to_f32();
+    for (j, (dj, mj)) in q4k_group_dm(&block).into_iter().enumerate() {
+      assert_eq!((dj, mj), (d * scale[j] as f32, min_d * min[j] as f32));
+    }
+    assert_eq!(q4k_dm_bytes(&block)[0..4], (d * scale[0] as f32).to_le_bytes());
     let packed = q4k_packed(&block);
     for group in 0..64 {
       let local = group * 4;

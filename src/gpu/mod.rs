@@ -13,7 +13,7 @@ pub use wgpu::Buffer;
 
 use crate::error::{Error, Result, bail};
 use crate::gguf::{
-  Tensor, Type, q4_0_packed, q4_1_packed, q4k_packed, q4k_scales, q5_1_packed, q5_packed,
+  Tensor, Type, q4_0_packed, q4_1_packed, q4k_dm_bytes, q4k_packed, q5_1_packed, q5_packed,
 };
 
 /// Pipeline order: F32, F16, Q8_0, Q5_0, Q4_0, Q4_1, Q5_1, Q4_K.
@@ -466,12 +466,13 @@ impl Portable {
         .map(|ty| match cpu {
           true => pipeline(device, &gemm, "gemm64", &[("WTYPE", ty as f64)]),
           false => {
+            // Q4_K stages half as many columns. One f16 quad per k-step is `cols * 8` entries.
+            let cols = if ty == 7 { 64 } else { gemm_tile[0] };
             let constants = [
               ("WTYPE", ty as f64),
               ("ROWS", gemm_tile[1] as f64),
-              ("COLS", gemm_tile[0] as f64),
-              // 32 k-steps by COLS/4 column quads.
-              ("WT", (gemm_tile[0] * 8) as f64),
+              ("COLS", cols as f64),
+              ("WT", (cols * 8) as f64),
             ];
             pipeline(device, &gemm, "gemm", &constants)
           }
@@ -580,8 +581,8 @@ struct TensorGemm {
 /// A linear layer `y = x·Wᵀ + b` with `W` row-major `[n][k]`, kept in its GGUF type. Q8_0 is
 /// int8 data (4 per u32) plus one f16 scale per 32 weights. Q5_0 and Q5_1 are 5-bit codes in
 /// weight order, 24 bytes per 32. Q4_0 and Q4_1 are nibbles in weight order, 16 bytes per 32.
-/// Q4_K is nibbles in weight order, 128 bytes per 256, plus the superblock scale, minimum, and
-/// eight decoded scales and minimums (20 bytes). Q8_0, Q5_0 and Q4_0 share one f16 scale per
+/// Q4_K is nibbles in weight order, 128 bytes per 256, plus eight f32 pairs per block
+/// (`d·scale`, `dmin·min`, 64 bytes). Q8_0, Q5_0 and Q4_0 share one f16 scale per
 /// block. Q4_1 and Q5_1 store an f16 minimum beside it.
 pub struct Linear {
   /// Rows of `W`, padded to a multiple of 64 for the tile reads.
@@ -1130,11 +1131,12 @@ impl Gpu {
         if weights.iter().any(|w| !w.len().is_multiple_of(256)) {
           bail!("linear layer {k}→{rows}: Q4_K needs a multiple of 256 weights");
         }
-        // 128 bytes of nibbles and 20 bytes of scales per block of 256. Pieces of 8192 blocks.
+        // 128 bytes of nibbles and 64 bytes of f32 group products per block of 256. Pieces of
+        // 8192 blocks.
         let blocks = |rows: usize| rows * k / 256;
         let (mut dv, mut sv) = (
           self.fill(blocks(n) * 128, blocks(rows) * 128)?,
-          self.fill(blocks(n) * 20, blocks(rows) * 20)?,
+          self.fill(blocks(n) * 64, blocks(rows) * 64)?,
         );
         let mut block = 0;
         for w in weights {
@@ -1143,8 +1145,8 @@ impl Gpu {
             let (a, b) = (block + i / 144, block + i / 144 + blocks.len());
             let d = dv.slice(a * 128..b * 128).into_chunks::<128>().0;
             d.write_iter(blocks.iter().map(q4k_packed));
-            let s = sv.slice(a * 20..b * 20).into_chunks::<20>().0;
-            s.write_iter(blocks.iter().map(q4k_scales));
+            let s = sv.slice(a * 64..b * 64).into_chunks::<64>().0;
+            s.write_iter(blocks.iter().map(q4k_dm_bytes));
           })?;
           block += w.len() / 256;
         }
@@ -2020,7 +2022,9 @@ impl<'a> Pass<'a> {
         )
       }
       _ => {
-        let [cols, rows] = gpu.kernels.gemm_tile;
+        let [tile, rows] = gpu.kernels.gemm_tile;
+        // The Q4_K pipeline is compiled at 64 columns. A 64-wide CPU tile is already that shader.
+        let cols = if l.ty == 7 && tile == 128 { 64 } else { tile };
         let size = [l.n.div_ceil(cols), m.div_ceil(rows), 1];
         self.run(&gpu.kernels.gemm[l.ty], &buffers, &params, size)
       }
