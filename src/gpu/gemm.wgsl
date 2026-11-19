@@ -164,15 +164,18 @@ fn fetch(m0: u32, n0: u32, k0: u32, lid: u32) -> Fetch {
   return f;
 }
 
-// A workgroup computes a ROWS×128 tile of c: thread (tx, ty) = (lid % 16, lid / 16) rows ty + 16i
-// and columns 4tx.. and 64 + 4tx.., four each, summed over k in order. The next K step's loads
-// are issued before this one's products, which hides their latency on GPUs with few workgroups.
+// A workgroup computes a ROWS×128 tile of c. Thread (tx, ty) covers rows ty + 16i and columns
+// 4tx.. and 64 + 4tx.., four each, summed over k in order. The next K step's loads are issued
+// before this one's products, which hides their latency on GPUs with few workgroups. 64
+// consecutive threads share 8 column quads: a vec4 covers 4 of the 32 shared-memory banks, so 8
+// quads use each bank once. 16 quads in that group put quads 8 apart on the same banks.
 @compute @workgroup_size(256)
 fn gemm(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_index) lid: u32) {
   let n0 = wg.x * 128u;
   let m0 = wg.y * ROWS;
-  let tx = lid % 16u;
-  let ty = lid / 16u;
+  let lane = lid % 64u;
+  let tx = lane % 8u + 8u * ((lid / 64u) % 2u);
+  let ty = lane / 8u + 8u * (lid / 128u);
   var c00: vec4<f32>;
   var c01: vec4<f32>;
   var c10: vec4<f32>;

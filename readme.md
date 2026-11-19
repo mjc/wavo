@@ -112,6 +112,7 @@ wavo pull gigaam-v3 whisper-turbo     # download models
 wavo list                             # downloaded models
 wavo rm gigaam-v3                     # delete one
 wavo bench gigaam-v3 talk.wav         # load time and speed on your machine
+wavo bench gigaam-v3 talk.wav --profile  # the same, plus GPU time per dispatch
 wavo devices                          # the GPUs wavo sees, numbered for --device
 wavo debug                            # your system, GPUs and models, to paste into an issue
 ```
