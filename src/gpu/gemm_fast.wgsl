@@ -11,7 +11,7 @@
 enable f16;
 enable wgpu_cooperative_matrix;
 
-// 0: F32, 1: F16, 2: Q8_0, 3: Q5_0, 4: Q4_0, 5: Q4_1, 6: Q5_1, 7: Q4_K, 8: Q6_K.
+// 0: F32, 1: F16, 2: Q8_0, 3: Q5_0, 4: Q4_0, 5: Q4_1, 6: Q5_1, 7: Q4_K, 8: Q6_K, 9: Q5_K.
 override WTYPE: u32;
 const F: u32 = 8u;
 // 4F or 8F, and the K step.
@@ -225,6 +225,12 @@ fn q6k_4(x: u32) -> vec4<f32> {
   return codes * (d * sc);
 }
 
+// Same Q5_K load as gemm.wgsl. This module is not concatenated with that one.
+fn q5k_4(x: u32) -> vec4<f32> {
+  let s = q4k_dm(x);
+  return q5_codes4(x) * s.x - s.y;
+}
+
 // Stages a[m0 + i / (KS / 4)][k0 + i % (KS / 4) · 4 ..+4].
 fn stage_a(m0: u32, k0: u32, i: u32) {
   let r = i / (KS / 4u);
@@ -256,6 +262,7 @@ fn stage_w(n0: u32, k0: u32, i: u32) {
       case 6u: { v = q51_at(n0 + r, k0 + kk); }
       case 7u: { v = q4k_4(x); }
       case 8u: { v = q6k_4(x); }
+      case 9u: { v = q5k_4(x); }
       default: { v = vec4<f32>(unpack4xI8(w[x / 4u])) * scale(x / 32u); }
     }
   }

@@ -1,6 +1,6 @@
 // Copyright (c) vladkens | MIT License | https://github.com/vladkens/wavo
-//! GGUF v3 reader: metadata from the header, F32/F16/Q8_0/Q5_0/Q4_0/Q4_1/Q5_1/Q4_K/Q6_K tensors
-//! streamed from the file.
+//! GGUF v3 reader: metadata from the header, F32/F16/Q8_0/Q5_0/Q4_0/Q4_1/Q5_1/Q4_K/Q5_K/Q6_K
+//! tensors streamed from the file.
 
 use std::collections::HashMap;
 use std::fmt::Debug;
@@ -37,6 +37,13 @@ pub enum Type {
   /// a multiple of 256 shares a block with the next row.
   #[allow(non_camel_case_types)]
   Q4_K,
+  /// Blocks of 256 weights: f16 superblock scale, f16 superblock minimum, 12 bytes of 6-bit
+  /// scales and minimums, 32 high-bit bytes, 128 low nibbles (176 bytes). A weight is
+  /// `code · d · scale - dmin · min`, with `code` in 0..31 and `scale` and `min` in 0..63. The
+  /// element count is a multiple of 256. Blocks follow weight order, so a row whose length is not
+  /// a multiple of 256 shares a block with the next row.
+  #[allow(non_camel_case_types)]
+  Q5_K,
   /// Blocks of 256 weights: 128 low-nibble bytes, 64 high-bit bytes, 16 i8 scales, one f16
   /// superblock scale (210 bytes). A weight is `d · scale · (code - 32)`, with `code` in 0..63
   /// and `scale` a signed i8. Sixteen weights share a scale. The element count is a multiple of
@@ -57,6 +64,7 @@ impl Type {
       7 => Some(Self::Q5_1),
       8 => Some(Self::Q8_0),
       12 => Some(Self::Q4_K),
+      13 => Some(Self::Q5_K),
       14 => Some(Self::Q6_K),
       _ => None,
     }
@@ -72,6 +80,7 @@ impl Type {
       Self::Q4_1 => n / 32 * 20,
       Self::Q5_1 => n / 32 * 24,
       Self::Q4_K => n / 256 * 144,
+      Self::Q5_K => n / 256 * 176,
       Self::Q6_K => n / 256 * 210,
     }
   }
@@ -177,7 +186,7 @@ pub(crate) fn scale_min_k4(scales: &[u8; 12], j: usize) -> (u8, u8) {
 
 /// Eight 6-bit scales and eight 6-bit minimums packed into the 12 byte Q4_K scale field.
 #[cfg(test)]
-fn pack_scales_k4(scale: &[u8; 8], min: &[u8; 8]) -> [u8; 12] {
+pub(crate) fn pack_scales_k4(scale: &[u8; 8], min: &[u8; 8]) -> [u8; 12] {
   let mut s = [0u8; 12];
   for j in 0..8 {
     if j < 4 {
@@ -263,6 +272,75 @@ pub(crate) fn q6k_codes(block: &[u8; 210]) -> [i8; 256] {
 /// Q6_K codes in weight order as i8, already minus 32. 256 bytes per block.
 pub(crate) fn q6k_packed(block: &[u8; 210]) -> [u8; 256] {
   q6k_codes(block).map(|c| c as u8)
+}
+
+/// Codes 0..31 of one Q5_K block, in weight order. Each group of 64 stores 32 low nibbles beside
+/// the next 32 in the high nibbles. `qh[l]` holds the fifth bit of weight `l` in each group of 32.
+pub(crate) fn q5k_codes(block: &[u8; 176]) -> [u8; 256] {
+  let qh = &block[16..48];
+  let qs = &block[48..];
+  let mut codes = [0u8; 256];
+  for g in 0..8 {
+    for l in 0..32 {
+      let byte = qs[32 * (g / 2) + l];
+      let nibble = if g % 2 == 0 { byte & 0x0f } else { byte >> 4 };
+      codes[g * 32 + l] = nibble + 16 * ((qh[l] >> g) & 1);
+    }
+  }
+  codes
+}
+
+/// Q5_K codes in the same 5-bit layout as Q5_0, 24 bytes per 32 weights.
+pub(crate) fn q5k_packed(block: &[u8; 176]) -> [u8; 192] {
+  let codes = q5k_codes(block);
+  let mut out = [0u8; 192];
+  for g in 0..8 {
+    let group: [u8; 32] = codes[g * 32..g * 32 + 32].try_into().unwrap();
+    out[g * 24..g * 24 + 24].copy_from_slice(&pack5(group));
+  }
+  out
+}
+
+/// Superblock f16 scale and minimum, then the eight decoded scales and eight decoded minimums.
+/// The first 16 bytes match a Q4_K block.
+pub(crate) fn q5k_scales(block: &[u8; 176]) -> [u8; 20] {
+  let mut out = [0u8; 20];
+  out[..4].copy_from_slice(&block[..4]);
+  let scales: &[u8; 12] = block[4..16].try_into().unwrap();
+  for j in 0..8 {
+    let (scale, min) = scale_min_k4(scales, j);
+    out[4 + j] = scale;
+    out[12 + j] = min;
+  }
+  out
+}
+
+/// One Q5_K block in ggml's file layout, for tests. `codes` are 0..31 in weight order.
+#[cfg(test)]
+pub(crate) fn q5k_block(
+  d: f32,
+  dmin: f32,
+  scale: &[u8; 8],
+  min: &[u8; 8],
+  codes: &[u8; 256],
+) -> [u8; 176] {
+  let mut block = [0u8; 176];
+  block[..2].copy_from_slice(&f16::from_f32(d).to_le_bytes());
+  block[2..4].copy_from_slice(&f16::from_f32(dmin).to_le_bytes());
+  block[4..16].copy_from_slice(&pack_scales_k4(scale, min));
+  for g in 0..8 {
+    for l in 0..32 {
+      let code = codes[g * 32 + l];
+      let qi = 32 * (g / 2) + l;
+      if g % 2 == 0 {
+        block[48 + qi] |= code & 0x0f;
+      } else {
+        block[48 + qi] |= (code & 0x0f) << 4;
+      }
+      block[16 + l] |= ((code >> 4) & 1) << g;
+    }
+  }
+  block
 }
 
 /// f16 superblock scale, then the sixteen i8 scales, then two zero bytes.
@@ -756,6 +834,9 @@ impl Gguf {
       if t.ty == Type::Q4_K && !n.is_multiple_of(256) {
         bail!("tensor {name}: Q4_K has {n} weights, not a multiple of 256");
       }
+      if t.ty == Type::Q5_K && !n.is_multiple_of(256) {
+        bail!("tensor {name}: Q5_K has {n} weights, not a multiple of 256");
+      }
       if t.ty == Type::Q6_K && !n.is_multiple_of(256) {
         bail!("tensor {name}: Q6_K has {n} weights, not a multiple of 256");
       }
@@ -904,6 +985,19 @@ impl Tensor<'_> {
           let scales: &[u8; 12] = block[4..16].try_into().unwrap();
           let qs: &[u8; 128] = block[16..].try_into().unwrap();
           let codes = q4k_codes(qs);
+          (0..8).flat_map(move |j| {
+            let (scale, m) = scale_min_k4(scales, j);
+            let (d1, m1) = (d * scale as f32, min * m as f32);
+            (0..32).map(move |l| d1 * codes[j * 32 + l] as f32 - m1)
+          })
+        })
+        .collect(),
+      Type::Q5_K => (b.as_chunks::<176>().0.iter())
+        .flat_map(|block| {
+          let d = f16::from_le_bytes([block[0], block[1]]).to_f32();
+          let min = f16::from_le_bytes([block[2], block[3]]).to_f32();
+          let scales: &[u8; 12] = block[4..16].try_into().unwrap();
+          let codes = q5k_codes(block);
           (0..8).flat_map(move |j| {
             let (scale, m) = scale_min_k4(scales, j);
             let (d1, m1) = (d * scale as f32, min * m as f32);
@@ -1223,6 +1317,7 @@ fn ggml_id(ty: Type) -> u32 {
     Type::Q5_1 => 7,
     Type::Q8_0 => 8,
     Type::Q4_K => 12,
+    Type::Q5_K => 13,
     Type::Q6_K => 14,
   }
 }
@@ -1887,6 +1982,44 @@ mod tests {
     let d = f16::from_f32(0.5).to_f32();
     let expected: Vec<f32> =
       (0..256).map(|i| d * scales[i / 16] as f32 * codes[i] as f32).collect();
+    assert_eq!(g.tensor("q", &[256]).unwrap().to_f32().unwrap(), expected);
+  }
+
+  /// A hand-built Q5_K block: codes 0..31, a 6-bit scale and minimum per 32 weights, and the f16
+  /// superblock scale and minimum. The low nibble of each pair of groups is the first 32 weights
+  /// and the high nibble the next 32. Bit `g` of `qh[l]` is the fifth bit of lane `l` in group `g`.
+  #[test]
+  fn q5_k_round_trips() {
+    let codes: [u8; 256] = std::array::from_fn(|i| ((i * 3) % 32) as u8);
+    let scale = [1u8, 2, 3, 4, 21, 22, 45, 63];
+    let min = [0u8, 1, 5, 7, 17, 33, 40, 62];
+    let block = q5k_block(0.5, 0.25, &scale, &min, &codes);
+
+    assert_eq!(q5k_codes(&block), codes);
+    let packed = q5k_packed(&block);
+    for g in 0..8 {
+      let chunk = &packed[g * 24..g * 24 + 24];
+      for i in 0..32 {
+        let bit = i * 5;
+        let byte = bit / 8;
+        let word = u16::from_le_bytes([chunk[byte], chunk[byte + 1]]);
+        let code = ((word >> (bit % 8)) & 31) as u8;
+        assert_eq!(code, codes[g * 32 + i], "group {g} lane {i}");
+      }
+    }
+    let rec = q5k_scales(&block);
+    let d = f16::from_f32(0.5);
+    let dmin = f16::from_f32(0.25);
+    assert_eq!(&rec[..2], &d.to_le_bytes());
+    assert_eq!(&rec[2..4], &dmin.to_le_bytes());
+    assert_eq!(&rec[4..12], &scale);
+    assert_eq!(&rec[12..20], &min);
+
+    let g = Gguf::with_tensors(&[("q", &[256], Type::Q5_K, &block)]);
+    let (d, dmin) = (d.to_f32(), dmin.to_f32());
+    let expected: Vec<f32> = (0..256)
+      .map(|i| d * scale[i / 32] as f32 * codes[i] as f32 - dmin * min[i / 32] as f32)
+      .collect();
     assert_eq!(g.tensor("q", &[256]).unwrap().to_f32().unwrap(), expected);
   }
 

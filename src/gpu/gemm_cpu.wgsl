@@ -53,6 +53,7 @@ fn gemm64(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_index)
         case 6u: { v = q51_at(row, col); }
         case 7u: { v = q4k_4(x); }
         case 8u: { v = q6k_4(x); }
+        case 9u: { v = q5k_4(x); }
         default: { v = vec4<f32>(unpack4xI8(w[x / 4u])) * scale(x / 32u); }
       }
       let o = e / 32u * S + e % 32u;
