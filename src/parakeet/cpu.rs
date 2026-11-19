@@ -22,6 +22,8 @@ pub struct Encoder {
   /// Subsampling channels.
   ch: usize,
   mels: usize,
+  /// `sqrt(d_model)` when the file sets `xscaling`, else 1.
+  xscale: f32,
   conv0: Taps,
   conv2: Taps,
   conv3: Linear,
@@ -39,6 +41,7 @@ impl Encoder {
     ch: usize,
     joint: usize,
     mels: usize,
+    xscale: f32,
   ) -> Result<Self> {
     let d = cfg.d;
     let f32s = |name: String, dims: &[usize]| g.tensor(&name, dims)?.to_f32();
@@ -56,6 +59,7 @@ impl Encoder {
     Ok(Self {
       ch,
       mels,
+      xscale,
       conv0: conv(0)?,
       conv2: conv(2)?,
       conv3: linear("enc.pre_encode.conv.3", &[1, 1, ch, ch])?,
@@ -98,6 +102,11 @@ impl Encoder {
 
     let mut x = vec![0.0; t * d];
     gemm(&h, &self.out, &mut x, t, Epilogue::Bias);
+    if self.xscale != 1.0 {
+      for v in &mut x {
+        *v *= self.xscale;
+      }
+    }
     let x = self.conformer.run(x, t, &rel_positions(d, t as i64 + 15, pos_rows(t)));
     let mut out = vec![0.0; t * self.joint.n];
     gemm(&x, &self.joint, &mut out, t, Epilogue::Bias);

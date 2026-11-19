@@ -1,8 +1,9 @@
 // Copyright (c) vladkens | MIT License | https://github.com/vladkens/wavo
 //! Encoder on the GPU: 8× subsampling of the mel image `[t][freq]` by 3×3 stride-2 convs (conv0 +
 //! ReLU, depthwise conv2, pointwise conv3 + ReLU, depthwise conv5, pointwise conv6 + ReLU),
-//! flattened to `[t][channel · freq]` and projected to d_model, then the Conformer blocks with
-//! relative positions, then the joint's encoder projection. All dispatches of a call go into one
+//! flattened to `[t][channel · freq]` and projected to d_model. When the file sets `xscaling` that
+//! projection is multiplied by `sqrt(d_model)` before the Conformer blocks with relative positions,
+//! then the joint's encoder projection. All dispatches of a call go into one
 //! compute pass over a preallocated arena.
 
 use std::sync::{Mutex, PoisonError};
@@ -21,6 +22,8 @@ pub struct Encoder {
   /// Subsampling channels.
   ch: usize,
   mels: usize,
+  /// `sqrt(d_model)` when the file sets `xscaling`, else 1.
+  xscale: f32,
   conv0: Channels,
   conv2: Channels,
   conv3: Linear,
@@ -55,6 +58,7 @@ impl Encoder {
     ch: usize,
     joint: usize,
     mels: usize,
+    xscale: f32,
   ) -> Result<Self> {
     let d = cfg.d;
     let f32s = |name: String, dims: &[usize]| g.tensor(&name, dims)?.to_f32();
@@ -69,6 +73,7 @@ impl Encoder {
     Ok(Self {
       ch,
       mels,
+      xscale,
       conv0: conv(0)?,
       conv2: conv(2)?,
       conv3: linear("enc.pre_encode.conv.3", &[1, 1, ch, ch])?,
@@ -127,6 +132,10 @@ impl Encoder {
     p.gemm(&b.h, &self.conv6, &b.qk, t * f, Epilogue::Relu);
     p.flatten(&b.qk, &b.h, t, f, ch);
     p.gemm(&b.h, &self.out, &b.x, t, Epilogue::Bias);
+    // Same dispatches on every call of one model: models with xscaling false skip this kernel.
+    if self.xscale != 1.0 {
+      p.scale(&b.x, t * self.conformer.cfg.d, self.xscale);
+    }
     let x = self.conformer.record(p, b, t);
     p.gemm(x, &self.joint, out, t, Epilogue::Bias);
   }

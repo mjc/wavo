@@ -47,6 +47,7 @@ at a time: port it, match the reference exactly, make it fast, move on. Tick a p
       (#100); OpenAI's `diarized_json` in `wavo serve`.
       [Plan](plans/completed/20261110-diarization.md)
 - [x] **Parakeet TDT 1.1b:** 80 mel bins and encoder biases. English, lowercase, no punctuation.
+- [x] **Parakeet Unified:** offline RNN-T, encoder xscaling, full attention. English, cased, punctuated.
 - [x] **Docker image** `ghcr.io/vladkens/wavo`, x86_64 and arm64, pushed on main and on release:
       Intel and AMD GPUs through `/dev/dri` on x86_64, else the CPU; on an N100 as fast as outside
       it (#116).
@@ -89,6 +90,5 @@ Later research: **accuracy against the originals.** Plan: [docs/plans/20261011-a
 
 Later, only on request: streaming, slowing fast speech down before recognition
 (pitch-keeping time-stretch such as WSOLA; first measure WER on samples sped up with ffmpeg
-`atempo`, with and without slowing them back down). `parakeet-unified-en-0.6b` comes with
-streaming: its value is one model for offline and low-latency streaming; it was tried in #65
-(branch history).
+`atempo`, with and without slowing them back down). `parakeet-unified` transcribes offline with
+full attention. Its streaming mode stays later.

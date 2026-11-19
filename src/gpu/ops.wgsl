@@ -264,6 +264,18 @@ fn relu(@builtin(global_invocation_id) id: vec3<u32>) {
   }
 }
 
+// Multiply x[0..p.t] by p.scale, in place. Parakeet applies sqrt(d_model) after subsampling when
+// the file sets xscaling.
+
+@group(0) @binding(0) var<storage, read_write> sc_x: array<f32>;
+
+@compute @workgroup_size(256)
+fn scale(@builtin(global_invocation_id) id: vec3<u32>) {
+  if (id.x < p.t) {
+    sc_x[id.x] = sc_x[id.x] * p.scale;
+  }
+}
+
 // The index of the largest of x[0..p.t], the lowest one on a tie, as the bits of am_out[0]: the
 // maximum, then the largest −i where it occurs (exact in f32 below 2^24).
 

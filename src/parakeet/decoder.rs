@@ -1,9 +1,11 @@
 // Copyright (c) vladkens | MIT License | https://github.com/vladkens/wavo
-//! TDT greedy decoding on the CPU: a predictor of stacked LSTM layers over the last emitted token,
-//! and a joint `out(relu(enc + pred(h)))` whose outputs are the token logits, then one logit per
-//! duration (how many frames to advance). The encoder side of the joint is projected on the GPU.
-//! Q8_0 weights stay Q8_0, so an LSTM step and a joint (V3's: 13.5 MB) stay in the performance
-//! cores' L2; F32 and F16 ones (some converted models) are kept as f32.
+//! TDT and offline RNN-T greedy decoding on the CPU: a predictor of stacked LSTM layers over the
+//! last emitted token, and a joint `out(relu(enc + pred(h)))`. TDT's outputs are the token logits,
+//! then one logit per duration (how many frames to advance). RNN-T's outputs are the token logits
+//! only: a blank moves one frame, and a token is emitted at the current frame. The encoder side of
+//! the joint is projected on the GPU. Q8_0 weights stay Q8_0, so an LSTM step and a joint (V3's:
+//! 13.5 MB) stay in the performance cores' L2; F32 and F16 ones (some converted models) are kept
+//! as f32.
 
 use crate::cpu::{Matrix, matvecs};
 use crate::error::{Result, bail};
@@ -15,6 +17,7 @@ pub struct Decoder {
   /// Token classes, blank included.
   classes: usize,
   blank: usize,
+  /// Empty for RNN-T, whose joint has no duration outputs.
   durations: Vec<usize>,
   max_symbols: usize,
   /// Parakeet Ultra's `max_symbols` decisions per frame for the whole clip, not per frame.
@@ -42,21 +45,39 @@ impl Decoder {
   pub fn new(g: &Gguf, classes: usize, blank: usize) -> Result<Self> {
     let u = |key: &str| g.get::<u32>(&format!("stt.parakeet.{key}")).map(|v| v as usize);
     let (hidden, joint) = (u("predictor.hidden")?, u("joint.hidden")?);
-    let durations = g.array::<i32>("stt.parakeet.tdt.durations")?;
-    let max_symbols = u("tdt.max_symbols")?;
     g.check("stt.parakeet.joint.activation", &["relu"])?;
     g.check("stt.parakeet.predictor.vocab", &[classes as u32])?;
-    if u("joint.num_extra_outputs")? != durations.len() || durations.iter().any(|&d| d < 0) {
-      bail!("TDT durations {durations:?} don't match the joint's extra outputs");
-    }
-    let global = match g.optional::<&str>("stt.parakeet.tdt.symbol_budget")? {
-      None | Some("per_frame") => false,
-      Some("global") => true,
-      Some(other) => bail!("stt.parakeet.tdt.symbol_budget is {other:?}"),
+    let (durations, max_symbols, global) = match g.get::<&str>("stt.parakeet.head_kind")? {
+      "rnnt" => {
+        if u("joint.num_extra_outputs")? != 0 {
+          bail!("RNN-T joint.num_extra_outputs is not 0");
+        }
+        let durations = g.optional_array::<i32>("stt.parakeet.tdt.durations")?;
+        if !durations.is_empty() {
+          bail!("RNN-T durations {durations:?}");
+        }
+        // Absent means no per-frame cap, as the reference's CTC path stores 0.
+        let max_symbols = g.optional::<u32>("stt.parakeet.tdt.max_symbols")?.unwrap_or(0) as usize;
+        (Vec::new(), max_symbols, false)
+      }
+      "tdt" => {
+        let durations = g.array::<i32>("stt.parakeet.tdt.durations")?;
+        let max_symbols = u("tdt.max_symbols")?;
+        if u("joint.num_extra_outputs")? != durations.len() || durations.iter().any(|&d| d < 0) {
+          bail!("TDT durations {durations:?} don't match the joint's extra outputs");
+        }
+        let global = match g.optional::<&str>("stt.parakeet.tdt.symbol_budget")? {
+          None | Some("per_frame") => false,
+          Some("global") => true,
+          Some(other) => bail!("stt.parakeet.tdt.symbol_budget is {other:?}"),
+        };
+        if max_symbols == 0 {
+          bail!("stt.parakeet.tdt.max_symbols is 0");
+        }
+        (durations, max_symbols, global)
+      }
+      other => bail!("stt.parakeet.head_kind is {other:?}"),
     };
-    if max_symbols == 0 {
-      bail!("stt.parakeet.tdt.max_symbols is 0");
-    }
     let t = |name: &str, dims: &[usize]| g.tensor(name, dims).and_then(|t| t.to_f32());
     let q = |name: &str, dims: &[usize]| g.tensor(name, dims).and_then(|t| Matrix::new(&t));
     let lstm = (0..u("predictor.n_layers")?)
@@ -92,14 +113,19 @@ impl Decoder {
     let j = self.joint;
     let mut state = vec![0.0; 2 * self.lstm.len() * self.hidden];
     let (mut next, mut pred) = self.predict(None, &state);
-    let budget = (self.max_symbols, self.global);
-    greedy(enc.len() / width, self.blank, &self.durations, budget, |t, emitted| {
+    let mut step = |t: usize, emitted: Option<usize>| {
       if let Some(token) = emitted {
         state = std::mem::take(&mut next);
         (next, pred) = self.predict(Some(token), &state);
       }
       self.joint(&enc[t * width..][..j], &pred)
-    })
+    };
+    let frames = enc.len() / width;
+    if self.durations.is_empty() {
+      greedy_rnnt(frames, self.blank, self.max_symbols, |t, emitted| step(t, emitted).0)
+    } else {
+      greedy(frames, self.blank, &self.durations, (self.max_symbols, self.global), step)
+    }
   }
 
   /// One step of the LSTM layers from `state` (per layer h, then c) on the embedding of `token`,
@@ -190,6 +216,39 @@ fn greedy(
   out
 }
 
+/// RNN-T greedy search over `frames`, as `decode_rnnt_greedy` in transcribe.cpp's
+/// `src/arch/parakeet/decoder.cpp`. `joint(t, emitted)` scores frame t and returns the token;
+/// `emitted` is the token of the previous decision when it emitted one, for the predictor to step
+/// on. A blank moves one frame. A token is emitted at the current frame, and that frame advances
+/// once `max_symbols` tokens have been emitted on it when `max_symbols` is positive. Zero leaves
+/// the frame until a blank. The search stops after `16 * frames + 1024` decisions.
+fn greedy_rnnt(
+  frames: usize,
+  blank: usize,
+  max_symbols: usize,
+  mut joint: impl FnMut(usize, Option<usize>) -> usize,
+) -> Vec<(u32, u32)> {
+  let (mut out, mut t, mut symbols, mut emitted) = (Vec::new(), 0, 0, None);
+  let mut left = 16 * frames + 1024;
+  while t < frames && left > 0 {
+    left -= 1;
+    let token = joint(t, emitted.take());
+    if token == blank {
+      t += 1;
+      symbols = 0;
+      continue;
+    }
+    out.push((token as u32, t as u32));
+    emitted = Some(token);
+    symbols += 1;
+    if max_symbols > 0 && symbols >= max_symbols {
+      t += 1;
+      symbols = 0;
+    }
+  }
+  out
+}
+
 #[cfg(test)]
 mod tests {
   const BLANK: usize = 9;
@@ -254,5 +313,37 @@ mod tests {
     let frames: Vec<u32> = out.iter().map(|&(_, t)| t).collect();
     assert_eq!(frames, [vec![0; 12], vec![1; 7]].concat());
     assert_eq!(calls.len(), 20);
+  }
+
+  fn run_rnnt(frames: usize, max_symbols: usize, script: &[usize]) -> (Vec<(u32, u32)>, Calls) {
+    let mut calls = Vec::new();
+    let mut script = script.iter();
+    let out = super::greedy_rnnt(frames, BLANK, max_symbols, |t, emitted| {
+      calls.push((t, emitted));
+      *script.next().expect("script too short")
+    });
+    assert!(script.next().is_none(), "script too long");
+    (out, calls)
+  }
+
+  #[test]
+  fn rnnt_blank_advances_and_tokens_stay() {
+    let (out, calls) = run_rnnt(3, 0, &[BLANK, 5, BLANK, 6, BLANK]);
+    assert_eq!(out, [(5, 1), (6, 2)]);
+    assert_eq!(calls, [(0, None), (1, None), (1, Some(5)), (2, None), (2, Some(6))]);
+  }
+
+  #[test]
+  fn rnnt_max_symbols_advances() {
+    let (out, calls) = run_rnnt(2, 1, &[5, BLANK]);
+    assert_eq!(out, [(5, 0)]);
+    assert_eq!(calls, [(0, None), (1, Some(5))]);
+  }
+
+  #[test]
+  fn rnnt_two_tokens_then_blank_stay_on_the_frame() {
+    let (out, calls) = run_rnnt(2, 0, &[5, 6, BLANK, BLANK]);
+    assert_eq!(out, [(5, 0), (6, 0)]);
+    assert_eq!(calls, [(0, None), (0, Some(5)), (0, Some(6)), (1, None)]);
   }
 }
