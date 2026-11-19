@@ -194,7 +194,8 @@ fn tile<const R: usize, const F: usize>(w: &[f32], z: &[f32], k: usize) -> [[f32
 /// Weights `[rows][k]` for `matvecs`. Q8_0, Q5_0 and Q4_0 keep signed codes and one f32 scale per
 /// 32 weights (`q · d`, exact in f32). Q4_1 and Q5_1 expand to f32, because each block also has a
 /// minimum; the flat length has to be a whole number of blocks, or the last row is short. Q4_K
-/// expands to f32, because each block also has a minimum. F32 and F16 stay as f32, as the
+/// expands to f32, because each block also has a minimum. Q6_K expands to f32: each weight is a
+/// 6-bit code times an i8 scale times the superblock scale. F32 and F16 stay as f32, as the
 /// reference reads them.
 pub enum Matrix {
   Q8(Q8),
@@ -213,7 +214,7 @@ impl Matrix {
       bail!("quantized weights of {n} are not a whole number of blocks");
     }
     Ok(match t.ty {
-      Type::F32 | Type::F16 | Type::Q4_1 | Type::Q5_1 | Type::Q4_K => {
+      Type::F32 | Type::F16 | Type::Q4_1 | Type::Q5_1 | Type::Q4_K | Type::Q6_K => {
         Self::F32 { k, w: t.to_f32()? }
       }
       Type::Q8_0 => Self::Q8(Q8::new(&[t])?),

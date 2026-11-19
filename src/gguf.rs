@@ -1,5 +1,5 @@
 // Copyright (c) vladkens | MIT License | https://github.com/vladkens/wavo
-//! GGUF v3 reader: metadata from the header, F32/F16/Q8_0/Q5_0/Q4_0/Q4_1/Q5_1/Q4_K tensors
+//! GGUF v3 reader: metadata from the header, F32/F16/Q8_0/Q5_0/Q4_0/Q4_1/Q5_1/Q4_K/Q6_K tensors
 //! streamed from the file.
 
 use std::collections::HashMap;
@@ -37,6 +37,13 @@ pub enum Type {
   /// a multiple of 256 shares a block with the next row.
   #[allow(non_camel_case_types)]
   Q4_K,
+  /// Blocks of 256 weights: 128 low-nibble bytes, 64 high-bit bytes, 16 i8 scales, one f16
+  /// superblock scale (210 bytes). A weight is `d · scale · (code - 32)`, with `code` in 0..63
+  /// and `scale` a signed i8. Sixteen weights share a scale. The element count is a multiple of
+  /// 256. Blocks follow weight order, so a row whose length is not a multiple of 256 shares a
+  /// block with the next row.
+  #[allow(non_camel_case_types)]
+  Q6_K,
 }
 
 impl Type {
@@ -50,6 +57,7 @@ impl Type {
       7 => Some(Self::Q5_1),
       8 => Some(Self::Q8_0),
       12 => Some(Self::Q4_K),
+      14 => Some(Self::Q6_K),
       _ => None,
     }
   }
@@ -64,6 +72,7 @@ impl Type {
       Self::Q4_1 => n / 32 * 20,
       Self::Q5_1 => n / 32 * 24,
       Self::Q4_K => n / 256 * 144,
+      Self::Q6_K => n / 256 * 210,
     }
   }
 }
@@ -229,6 +238,38 @@ pub(crate) fn q4k_scales(block: &[u8; 144]) -> [u8; 20] {
     out[4 + j] = scale;
     out[12 + j] = min;
   }
+  out
+}
+
+/// Signed codes −32..31 of one Q6_K block, in weight order. `ql` holds the low 4 bits, `qh` the
+/// high 2 bits. For half `ip` and lane `il`, the four weights are `128·ip + il + {0,32,64,96}`.
+pub(crate) fn q6k_codes(block: &[u8; 210]) -> [i8; 256] {
+  let mut codes = [0i8; 256];
+  for ip in 0..2 {
+    for il in 0..32 {
+      let ql0 = block[64 * ip + il];
+      let ql32 = block[64 * ip + 32 + il];
+      let qh = block[128 + 32 * ip + il];
+      let at = 128 * ip + il;
+      codes[at] = ((ql0 & 0x0f) | ((qh & 3) << 4)) as i8 - 32;
+      codes[at + 32] = ((ql32 & 0x0f) | (((qh >> 2) & 3) << 4)) as i8 - 32;
+      codes[at + 64] = ((ql0 >> 4) | (((qh >> 4) & 3) << 4)) as i8 - 32;
+      codes[at + 96] = ((ql32 >> 4) | (((qh >> 6) & 3) << 4)) as i8 - 32;
+    }
+  }
+  codes
+}
+
+/// Q6_K codes in weight order as i8, already minus 32. 256 bytes per block.
+pub(crate) fn q6k_packed(block: &[u8; 210]) -> [u8; 256] {
+  q6k_codes(block).map(|c| c as u8)
+}
+
+/// f16 superblock scale, then the sixteen i8 scales, then two zero bytes.
+pub(crate) fn q6k_scales(block: &[u8; 210]) -> [u8; 20] {
+  let mut out = [0u8; 20];
+  out[..2].copy_from_slice(&block[208..210]);
+  out[2..18].copy_from_slice(&block[192..208]);
   out
 }
 
@@ -715,6 +756,9 @@ impl Gguf {
       if t.ty == Type::Q4_K && !n.is_multiple_of(256) {
         bail!("tensor {name}: Q4_K has {n} weights, not a multiple of 256");
       }
+      if t.ty == Type::Q6_K && !n.is_multiple_of(256) {
+        bail!("tensor {name}: Q6_K has {n} weights, not a multiple of 256");
+      }
       if g.data + t.offset + t.ty.size(n) > len {
         bail!("tensor {name} is out of file bounds");
       }
@@ -865,6 +909,14 @@ impl Tensor<'_> {
             let (d1, m1) = (d * scale as f32, min * m as f32);
             (0..32).map(move |l| d1 * codes[j * 32 + l] as f32 - m1)
           })
+        })
+        .collect(),
+      Type::Q6_K => (b.as_chunks::<210>().0.iter())
+        .flat_map(|block| {
+          let d = f16::from_le_bytes([block[208], block[209]]).to_f32();
+          let scales: &[u8; 16] = block[192..208].try_into().unwrap();
+          let codes = q6k_codes(block);
+          (0..256).map(move |i| d * scales[i / 16] as i8 as f32 * codes[i] as f32)
         })
         .collect(),
     })
@@ -1171,6 +1223,7 @@ fn ggml_id(ty: Type) -> u32 {
     Type::Q5_1 => 7,
     Type::Q8_0 => 8,
     Type::Q4_K => 12,
+    Type::Q6_K => 14,
   }
 }
 
@@ -1797,6 +1850,44 @@ mod tests {
     assert_eq!(zeros, vec![0u8; 144]);
     let g = Gguf::with_tensors(&[("z", &[256], Type::Q4_K, &zeros)]);
     assert_eq!(g.tensor("z", &[256]).unwrap().to_f32().unwrap(), vec![0.0; 256]);
+  }
+
+  /// A hand-built Q6_K block: 6-bit codes minus 32, times an i8 scale, times the f16 superblock
+  /// scale. The GPU pack stores those signed codes in weight order.
+  #[test]
+  fn q6_k_round_trips() {
+    let codes: [i8; 256] = std::array::from_fn(|i| ((i * 3) % 64) as i8 - 32);
+    let scales: [i8; 16] = std::array::from_fn(|i| (i as i8) * 3 - 20);
+    let mut block = [0u8; 210];
+    for ip in 0..2 {
+      for il in 0..32 {
+        let at = 128 * ip + il;
+        let c = |i: usize| (codes[i] as i16 + 32) as u8;
+        let (c0, c32, c64, c96) = (c(at), c(at + 32), c(at + 64), c(at + 96));
+        block[64 * ip + il] = (c0 & 0x0f) | ((c64 & 0x0f) << 4);
+        block[64 * ip + 32 + il] = (c32 & 0x0f) | ((c96 & 0x0f) << 4);
+        block[128 + 32 * ip + il] =
+          (c0 >> 4) | ((c32 >> 4) << 2) | ((c64 >> 4) << 4) | ((c96 >> 4) << 6);
+      }
+    }
+    for (i, s) in scales.iter().enumerate() {
+      block[192 + i] = *s as u8;
+    }
+    block[208..210].copy_from_slice(&f16::from_f32(0.5).to_le_bytes());
+
+    assert_eq!(q6k_codes(&block), codes);
+    let packed = q6k_packed(&block);
+    assert_eq!(packed, codes.map(|c| c as u8));
+    let rec = q6k_scales(&block);
+    assert_eq!(&rec[..2], &f16::from_f32(0.5).to_le_bytes());
+    assert_eq!(&rec[2..18], &scales.map(|s| s as u8));
+    assert_eq!(&rec[18..], &[0, 0]);
+
+    let g = Gguf::with_tensors(&[("q", &[256], Type::Q6_K, &block)]);
+    let d = f16::from_f32(0.5).to_f32();
+    let expected: Vec<f32> =
+      (0..256).map(|i| d * scales[i / 16] as f32 * codes[i] as f32).collect();
+    assert_eq!(g.tensor("q", &[256]).unwrap().to_f32().unwrap(), expected);
   }
 
   /// A diagonal inverse leaves every weight where it was, so the bytes match round-to-nearest.
