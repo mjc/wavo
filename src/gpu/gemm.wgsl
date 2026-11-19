@@ -40,7 +40,7 @@ var<immediate> p: Params;
 @group(0) @binding(2) var<storage, read_write> c: array<f32>;
 // F32 as bits, F16 as pairs, Q8_0 as 4 int8 per word, Q4 as nibbles (16 bytes per 32), Q5 as
 // 5-bit codes (24 bytes per 32), Q4_K as nibbles (128 bytes per 256), Q6_K as i8 codes already
-// minus 32 (256 bytes per 256), Q5_K as bytes 0..31 (256 bytes per 256).
+// minus 32 (256 bytes per 256), Q5_K as low nibbles then fifth bits (160 bytes per 256).
 @group(0) @binding(3) var<storage, read> w: array<u32>;
 // Q8_0, Q5_0 and Q4_0: one f16 scale per block, two per word. Q4_1 and Q5_1: an f16 scale and an
 // f16 minimum, one pair per word. Q4_K: 20 bytes per 256 weights (f16 scale, f16 minimum, eight
@@ -239,14 +239,24 @@ fn q6k_4(x: u32) -> vec4<f32> {
   return codes * (d * sc);
 }
 
-// Four Q5_K weights at x (a multiple of 4). Codes are bytes 0..31 in weight order, so one word
-// holds four. The scale record is the same one Q4_K uses.
-fn q5k_4(x: u32) -> vec4<f32> {
+// Four Q5_K codes at x (a multiple of 4). Low nibbles are in weight order, 128 bytes per 256,
+// then 32 bytes of fifth bits. A quad's fifth bits sit in one word.
+fn q5k_codes4(x: u32) -> vec4<f32> {
   let block = x / 256u;
   let local = x % 256u;
-  let codes = vec4<f32>(unpack4xI8(w[block * 64u + local / 4u]));
+  let bits = (w[block * 40u + local / 8u] >> ((local % 8u) * 4u)) & 0xFFFFu;
+  let h = (w[block * 40u + 32u + local / 32u] >> (local % 32u)) & 15u;
+  return vec4<f32>(
+    f32((bits & 15u) + 16u * (h & 1u)),
+    f32(((bits >> 4u) & 15u) + 16u * ((h >> 1u) & 1u)),
+    f32(((bits >> 8u) & 15u) + 16u * ((h >> 2u) & 1u)),
+    f32(((bits >> 12u) & 15u) + 16u * (h >> 3u)),
+  );
+}
+
+fn q5k_4(x: u32) -> vec4<f32> {
   let s = q4k_dm(x);
-  return codes * s.x - s.y;
+  return q5k_codes4(x) * s.x - s.y;
 }
 
 fn lane(v: vec4<f32>, x: u32) -> f32 {
@@ -473,7 +483,30 @@ fn dot8(row: u32, j: u32, a0: vec4<f32>, a1: vec4<f32>) -> f32 {
     case 6u: { return dot(q51_at(row, 8u * j), a0) + dot(q51_at(row, 8u * j + 4u), a1); }
     case 7u: { return dot(q4k_4(x), a0) + dot(q4k_4(x + 4u), a1); }
     case 8u: { return dot(q6k_4(x), a0) + dot(q6k_4(x + 4u), a1); }
-    case 9u: { return dot(q5k_4(x), a0) + dot(q5k_4(x + 4u), a1); }
+    case 9u: {
+      // x is a multiple of 8, so one word holds both quads and one group of 32 holds the scale.
+      let block = x / 256u;
+      let local = x % 256u;
+      let word = w[block * 40u + local / 8u];
+      let hi = w[block * 40u + 32u + local / 32u];
+      let h0 = (hi >> (local % 32u)) & 15u;
+      let h1 = (hi >> (local % 32u + 4u)) & 15u;
+      let c0 = vec4<f32>(
+        f32((word & 15u) + 16u * (h0 & 1u)),
+        f32(((word >> 4u) & 15u) + 16u * ((h0 >> 1u) & 1u)),
+        f32(((word >> 8u) & 15u) + 16u * ((h0 >> 2u) & 1u)),
+        f32(((word >> 12u) & 15u) + 16u * (h0 >> 3u)),
+      );
+      let c1 = vec4<f32>(
+        f32(((word >> 16u) & 15u) + 16u * (h1 & 1u)),
+        f32(((word >> 20u) & 15u) + 16u * ((h1 >> 1u) & 1u)),
+        f32(((word >> 24u) & 15u) + 16u * ((h1 >> 2u) & 1u)),
+        f32(((word >> 28u) & 15u) + 16u * (h1 >> 3u)),
+      );
+      let s = q4k_dm(x);
+      return dot(c0, a0) * s.x - (a0.x + a0.y + a0.z + a0.w) * s.y
+        + dot(c1, a1) * s.x - (a1.x + a1.y + a1.z + a1.w) * s.y;
+    }
     default: {
       let q = x / 4u;
       let d = dot(vec4<f32>(unpack4xI8(w[q])), a0) + dot(vec4<f32>(unpack4xI8(w[q + 1u])), a1);

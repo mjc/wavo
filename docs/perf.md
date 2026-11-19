@@ -198,6 +198,11 @@ two numbers (A/B/A, warm median unless stated), kept or rejected and why.
 
 ### GEMM
 
+- 2026-11-18, Whisper Q5_K: pack the GPU codes as low nibbles plus a fifth-bit plane, 160 bytes per
+  block, and load eight gemv weights from one word. RX 5700 XT, `jfk`, warm median of 10. Bytes /
+  nibbles / bytes: large-v3 796.7 / 774.6 / 795.6 ms. Turbo bytes 556.4, 556.9, 555.3 and nibbles
+  558.5, 558.3. Both jfk transcripts match Q8. Kept.
+
 - 2026-11-18, Whisper large-v3 Q5_K: timestamp each dispatch in its own pass on `jfk` (RX 5700 XT,
   one warm call; the sums run a little high). One call's gemv is Q8 93.8 ms, Q4_K 103.6, Q5_K 119.2.
   Attention and the other kernels match, about 194 ms. Encoder GEMMs are Q8 454 ms, Q4_K 460, Q5_K

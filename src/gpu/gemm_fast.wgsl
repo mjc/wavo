@@ -229,7 +229,14 @@ fn q6k_4(x: u32) -> vec4<f32> {
 fn q5k_4(x: u32) -> vec4<f32> {
   let block = x / 256u;
   let local = x % 256u;
-  let codes = vec4<f32>(unpack4xI8(w[block * 64u + local / 4u]));
+  let bits = (w[block * 40u + local / 8u] >> ((local % 8u) * 4u)) & 0xFFFFu;
+  let h = (w[block * 40u + 32u + local / 32u] >> (local % 32u)) & 15u;
+  let codes = vec4<f32>(
+    f32((bits & 15u) + 16u * (h & 1u)),
+    f32(((bits >> 4u) & 15u) + 16u * ((h >> 1u) & 1u)),
+    f32(((bits >> 8u) & 15u) + 16u * ((h >> 2u) & 1u)),
+    f32(((bits >> 12u) & 15u) + 16u * (h >> 3u)),
+  );
   let s = q4k_dm(x);
   return codes * s.x - s.y;
 }

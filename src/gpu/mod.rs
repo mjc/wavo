@@ -12,7 +12,7 @@ pub use wgpu::Buffer;
 use crate::error::{Error, Result, bail};
 use crate::gguf::{
   Tensor, Type, q4_0_packed, q4_1_packed, q4k_packed, q4k_scales, q5_1_packed, q5_packed,
-  q5k_codes, q5k_scales, q6k_packed, q6k_scales,
+  q5k_packed, q5k_scales, q6k_packed, q6k_scales,
 };
 
 /// Pipeline order: F32, F16, Q8_0, Q5_0, Q4_0, Q4_1, Q5_1, Q4_K, Q6_K, Q5_K.
@@ -448,8 +448,8 @@ struct TensorGemm {
 /// Q4_K is nibbles in weight order, 128 bytes per 256, plus the superblock scale, minimum, and
 /// eight decoded scales and minimums (20 bytes). Q6_K is i8 codes in weight order, already minus
 /// 32, 256 bytes per 256, plus an f16 superblock scale and sixteen i8 scales (20 bytes). Q5_K is
-/// bytes 0..31 in weight order, 256 per 256, plus the same 20-byte scale record as Q4_K. The file's
-/// 5-bit codes are expanded at upload: the gemv then loads them as one word.
+/// low nibbles in weight order, 128 bytes per 256, then 32 bytes of fifth bits, plus the same
+/// 20-byte scale record as Q4_K. The file's 5-bit codes are repacked at upload.
 /// Q8_0, Q5_0 and Q4_0 share one f16 scale per block. Q4_1 and Q5_1 store an f16 minimum beside it.
 pub struct Linear {
   /// Rows of `W`, padded to a multiple of 64 for the tile reads.
@@ -1036,10 +1036,10 @@ impl Gpu {
         if weights.iter().any(|w| !w.len().is_multiple_of(256)) {
           bail!("linear layer {k}→{rows}: Q5_K needs a multiple of 256 weights");
         }
-        // 256 bytes of codes and 20 bytes of scales per block of 256. Pieces of 8192 blocks.
+        // 160 bytes of codes and 20 bytes of scales per block of 256. Pieces of 8192 blocks.
         let blocks = |rows: usize| rows * k / 256;
         let (mut dv, mut sv) = (
-          self.fill(blocks(n) * 256, blocks(rows) * 256)?,
+          self.fill(blocks(n) * 160, blocks(rows) * 160)?,
           self.fill(blocks(n) * 20, blocks(rows) * 20)?,
         );
         let mut block = 0;
@@ -1047,8 +1047,8 @@ impl Gpu {
           w.read(176 << 13, |i, piece| {
             let blocks = piece.as_chunks::<176>().0;
             let (a, b) = (block + i / 176, block + i / 176 + blocks.len());
-            let d = dv.slice(a * 256..b * 256).into_chunks::<256>().0;
-            d.write_iter(blocks.iter().map(q5k_codes));
+            let d = dv.slice(a * 160..b * 160).into_chunks::<160>().0;
+            d.write_iter(blocks.iter().map(q5k_packed));
             let s = sv.slice(a * 20..b * 20).into_chunks::<20>().0;
             s.write_iter(blocks.iter().map(q5k_scales));
           })?;

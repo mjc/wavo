@@ -290,6 +290,22 @@ pub(crate) fn q5k_codes(block: &[u8; 176]) -> [u8; 256] {
   codes
 }
 
+/// GPU layout of one Q5_K block: 128 bytes of low nibbles in weight order, then 32 bytes whose
+/// bit `i % 8` is the fifth bit of weight `i`. Four consecutive fifth bits sit in one word.
+pub(crate) fn q5k_packed(block: &[u8; 176]) -> [u8; 160] {
+  let codes = q5k_codes(block);
+  let mut out = [0u8; 160];
+  for i in 0..128 {
+    out[i] = (codes[i * 2] & 0x0f) | ((codes[i * 2 + 1] & 0x0f) << 4);
+  }
+  for (i, code) in codes.iter().enumerate() {
+    if *code >= 16 {
+      out[128 + i / 8] |= 1 << (i % 8);
+    }
+  }
+  out
+}
+
 /// Superblock f16 scale and minimum, then the eight decoded scales and eight decoded minimums.
 /// The first 16 bytes match a Q4_K block.
 pub(crate) fn q5k_scales(block: &[u8; 176]) -> [u8; 20] {
@@ -1985,6 +2001,12 @@ mod tests {
     let block = q5k_block(0.5, 0.25, &scale, &min, &codes);
 
     assert_eq!(q5k_codes(&block), codes);
+    let packed = q5k_packed(&block);
+    for i in 0..256 {
+      let nibble = if i % 2 == 0 { packed[i / 2] & 0x0f } else { packed[i / 2] >> 4 };
+      let hi = (packed[128 + i / 8] >> (i % 8)) & 1;
+      assert_eq!(nibble + 16 * hi, codes[i]);
+    }
     let rec = q5k_scales(&block);
     let d = f16::from_f32(0.5);
     let dmin = f16::from_f32(0.25);

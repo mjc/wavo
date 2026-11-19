@@ -111,13 +111,18 @@ static float4 q4k_4(device const uchar *bytes, device const half *scales, int x)
   return codes * (d * float(scale)) - dmin * float(min);
 }
 
-// Q5_K codes are bytes 0..31 in weight order, 256 per block. The scale record matches Q4_K.
+// Q5_K codes are low nibbles then fifth bits, 160 bytes per block. The scale record matches Q4_K.
 static float4 q5k_4(device const uchar *bytes, device const half *scales, int x) {
   const int block = x >> 8;
   const int local = x & 255;
   const int sub = local >> 5;
-  device const uchar *codes = bytes + block * 256 + (local & ~3);
-  const float4 c = float4(float(codes[0]), float(codes[1]), float(codes[2]), float(codes[3]));
+  device const uint *words = (device const uint *)(bytes + block * 160);
+  const uint bits = (words[local / 8] >> ((local % 8) * 4)) & 0xFFFFu;
+  const uint h = (words[32 + local / 32] >> (local % 32)) & 15u;
+  const float4 c = float4(
+      float((bits & 15u) + 16u * (h & 1u)), float(((bits >> 4) & 15u) + 16u * ((h >> 1) & 1u)),
+      float(((bits >> 8) & 15u) + 16u * ((h >> 2) & 1u)),
+      float(((bits >> 12) & 15u) + 16u * (h >> 3)));
   device const uint *sc = (device const uint *)(scales + block * 10);
   const float d = float(scales[block * 10]);
   const float dmin = float(scales[block * 10 + 1]);
