@@ -225,13 +225,21 @@ fn q6k_4(x: u32) -> vec4<f32> {
   return codes * (d * sc);
 }
 
-// Same Q5_K load as gemm.wgsl. This module is not concatenated with that one.
+// At KS = 8 each thread keeps its row and visits four quads in one scale group.
+var<private> q5k_group: u32 = 0xFFFFFFFFu;
+var<private> q5k_scale: vec2<f32>;
+
+// Q5_K codes use gemm.wgsl's byte layout. Cache the scale pair per group of 32.
 fn q5k_4(x: u32) -> vec4<f32> {
   let block = x / 256u;
   let local = x % 256u;
   let codes = vec4<f32>(unpack4xI8(w[block * 64u + local / 4u]));
-  let s = q4k_dm(x);
-  return codes * s.x - s.y;
+  let group = x / 32u;
+  if (q5k_group != group) {
+    q5k_scale = q4k_dm(x);
+    q5k_group = group;
+  }
+  return codes * q5k_scale.x - q5k_scale.y;
 }
 
 // Stages a[m0 + i / (KS / 4)][k0 + i % (KS / 4) · 4 ..+4].
