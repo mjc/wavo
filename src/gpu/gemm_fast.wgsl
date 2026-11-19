@@ -188,22 +188,13 @@ fn q51_at(row: u32, col: u32) -> vec4<f32> {
 
 // Same Q4_K load as gemm.wgsl. This module is not concatenated with that one.
 fn q4k_codes4(x: u32) -> vec4<f32> {
-  let block = x / 256u;
-  let local = x % 256u;
-  let word = w[block * 32u + local / 8u];
-  let bits = (word >> ((local % 8u) * 4u)) & 0xFFFFu;
+  let bits = (w[x >> 3u] >> ((x & 4u) << 2u)) & 0xFFFFu;
   return vec4(f32(bits & 15u), f32((bits >> 4u) & 15u), f32((bits >> 8u) & 15u), f32((bits >> 12u) & 15u));
 }
 
 fn q4k_dm(x: u32) -> vec2<f32> {
-  let block = x / 256u;
-  let sub = (x % 256u) / 32u;
-  let base = block * 5u;
-  let hd = unpack2x16float(scales[base]);
-  let shift = (sub % 4u) * 8u;
-  let scale = (scales[base + 1u + sub / 4u] >> shift) & 255u;
-  let min = (scales[base + 3u + sub / 4u] >> shift) & 255u;
-  return vec2(hd.x * f32(scale), hd.y * f32(min));
+  let i = (x >> 5u) << 1u;
+  return vec2(bitcast<f32>(scales[i]), bitcast<f32>(scales[i + 1u]));
 }
 
 fn q4k_4(x: u32) -> vec4<f32> {

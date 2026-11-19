@@ -72,7 +72,7 @@ fn wav(sample: &str) -> Option<Vec<f32>> {
 fn packed_size(w: &WeightBytes) -> (u64, u64) {
   let (codes, scales) = if w.ty == 7 {
     let blocks = (w.n as u64) * (w.k as u64) / 256;
-    (blocks * 128, blocks * 20)
+    (blocks * 128, blocks * 64)
   } else {
     ((w.n as u64) * (w.k as u64) / 32 * 24, (w.n as u64) * (w.k as u64) / 16)
   };

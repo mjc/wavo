@@ -12,7 +12,7 @@ use std::sync::{Mutex, OnceLock, PoisonError};
 use half::f16;
 
 use crate::error::{Result, bail};
-use crate::gguf::{Tensor, Type, q4_codes, q5_codes};
+use crate::gguf::{Tensor, Type, q4_codes, q4k_group_dm, q4k_packed, q5_codes};
 use crate::{Api, Device, DeviceKind, Kernels};
 
 /// Dot product with 16 independent accumulators (four FMA vectors in flight), summed pairwise so
@@ -192,12 +192,13 @@ fn tile<const R: usize, const F: usize>(w: &[f32], z: &[f32], k: usize) -> [[f32
 }
 
 /// Weights `[rows][k]` for `matvecs`. Q8_0, Q5_0 and Q4_0 keep signed codes and one f32 scale per
-/// 32 weights (`q · d`, exact in f32). Q4_1 and Q5_1 expand to f32, because each block also has a
-/// minimum; the flat length has to be a whole number of blocks, or the last row is short. Q4_K
-/// expands to f32, because each block also has a minimum. F32 and F16 stay as f32, as the
-/// reference reads them.
+/// 32 weights (`q · d`, exact in f32). Q4_K keeps nibbles and the f32 products `d·scale` and
+/// `dmin·min` per 32 (`code · d · scale − dmin · min`, exact in f32). Q4_1 and Q5_1 expand to
+/// f32, because each block also has a minimum; the flat length has to be a whole number of
+/// blocks, or the last row is short. F32 and F16 stay as f32, as the reference reads them.
 pub enum Matrix {
   Q8(Q8),
+  Q4K(Q4K),
   F32 { k: usize, w: Vec<f32> },
 }
 
@@ -213,9 +214,8 @@ impl Matrix {
       bail!("quantized weights of {n} are not a whole number of blocks");
     }
     Ok(match t.ty {
-      Type::F32 | Type::F16 | Type::Q4_1 | Type::Q5_1 | Type::Q4_K => {
-        Self::F32 { k, w: t.to_f32()? }
-      }
+      Type::F32 | Type::F16 | Type::Q4_1 | Type::Q5_1 => Self::F32 { k, w: t.to_f32()? },
+      Type::Q4_K => Self::Q4K(Q4K::new(t)?),
       Type::Q8_0 => Self::Q8(Q8::new(&[t])?),
       Type::Q5_0 => {
         let mut b = Vec::new();
@@ -245,6 +245,7 @@ impl Matrix {
   pub fn row(&self, r: usize) -> Vec<f32> {
     match self {
       Self::Q8(q8) => q8.row(r),
+      Self::Q4K(q4) => q4.row(r),
       Self::F32 { k, w } => w[r * k..][..*k].to_vec(),
     }
   }
@@ -252,6 +253,7 @@ impl Matrix {
   fn len(&self) -> usize {
     match self {
       Self::Q8(q8) => q8.q.len() / q8.k,
+      Self::Q4K(q4) => q4.q.len() * 2 / q4.k,
       Self::F32 { k, w } => w.len() / k,
     }
   }
@@ -260,11 +262,74 @@ impl Matrix {
   fn rows(&self, r0: usize, x: &[f32], out: &mut [f32]) {
     match self {
       Self::Q8(q8) => q8.rows(r0, x, out),
+      Self::Q4K(q4) => q4.rows(r0, x, out),
       Self::F32 { k, w } => {
         for (o, w) in out.iter_mut().zip(w[r0 * k..].chunks_exact(*k)) {
           *o = dot(w, x);
         }
       }
+    }
+  }
+}
+
+/// Q4_K weights `[rows][k]`. `q` holds two nibbles per byte in weight order (low nibble first).
+/// `d` and `m` are `d·scale` and `dmin·min` for each flat group of 32. A weight is
+/// `code · d − m`, the same f32 as [`Tensor::to_f32`](crate::gguf::Tensor::to_f32).
+pub(crate) struct Q4K {
+  k: usize,
+  q: Vec<u8>,
+  d: Vec<f32>,
+  m: Vec<f32>,
+}
+
+impl Q4K {
+  fn new(t: &Tensor) -> Result<Self> {
+    let n = t.len();
+    if !n.is_multiple_of(256) {
+      bail!("Q4_K weights of {n} are not a whole number of blocks");
+    }
+    let (mut q, mut d, mut m) =
+      (Vec::with_capacity(n / 2), Vec::with_capacity(n / 32), Vec::with_capacity(n / 32));
+    // Pieces of whole 144-byte blocks.
+    t.read(144 << 13, |_, piece| {
+      for block in piece.as_chunks::<144>().0 {
+        q.extend_from_slice(&q4k_packed(block));
+        for (dj, mj) in q4k_group_dm(block) {
+          d.push(dj);
+          m.push(mj);
+        }
+      }
+    })?;
+    Ok(Self { k: t.dims[0], q, d, m })
+  }
+
+  fn code(&self, flat: usize) -> f32 {
+    let byte = self.q[flat / 2];
+    let code = if flat.is_multiple_of(2) { byte & 15 } else { byte >> 4 };
+    self.d[flat / 32] * code as f32 - self.m[flat / 32]
+  }
+
+  fn row(&self, r: usize) -> Vec<f32> {
+    let base = r * self.k;
+    (0..self.k).map(|i| self.code(base + i)).collect()
+  }
+
+  /// Rows from `r0` times `x` into `out`. A row whose width is a multiple of 32 dequantizes in
+  /// the AVX2 tile; every other width dequantizes one row and calls [`dot`].
+  fn rows(&self, r0: usize, x: &[f32], out: &mut [f32]) {
+    #[cfg(target_arch = "x86_64")]
+    if x86::avx2() && self.k.is_multiple_of(32) {
+      // SAFETY: the CPU has AVX2 and FMA, and each row is a whole number of groups of 32.
+      return unsafe { x86::q4k_rows(self, r0, x, out) };
+    }
+
+    let mut row = vec![0.0; self.k];
+    for (i, o) in out.iter_mut().enumerate() {
+      let base = (r0 + i) * self.k;
+      for (c, w) in row.iter_mut().enumerate() {
+        *w = self.code(base + c);
+      }
+      *o = dot(&row, x);
     }
   }
 }
@@ -358,7 +423,7 @@ impl Q8 {
 mod x86 {
   use std::arch::x86_64::*;
 
-  use super::{OnceLock, Q8};
+  use super::{OnceLock, Q4K, Q8};
 
   pub fn avx2() -> bool {
     is_x86_feature_detected!("avx2") && is_x86_feature_detected!("fma")
@@ -471,6 +536,53 @@ mod x86 {
           let hi = _mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(_mm_srli_si128::<8>(v)));
           acc[0] = _mm256_fmadd_ps(_mm256_mul_ps(lo, scale), xs[0], acc[0]);
           acc[1] = _mm256_fmadd_ps(_mm256_mul_ps(hi, scale), xs[1], acc[1]);
+        }
+      }
+
+      for (o, [a, b]) in out.iter_mut().zip(acc) {
+        *o = sum(a, b);
+      }
+    }
+  }
+
+  /// `dot` of Q4_K rows: each group of 32 is `code · d − m` in registers, then the same 16-wide
+  /// FMAs as [`dot`](super::dot). A short last group of rows repeats its last row.
+  #[target_feature(enable = "avx2,fma")]
+  pub fn q4k_rows(q4: &Q4K, r0: usize, x: &[f32], out: &mut [f32]) {
+    let k = q4.k;
+    let (q, d, m, x) = (&q4.q, &q4.d, &q4.m, &x[..k]);
+    let nib = _mm_set1_epi8(0x0f);
+    for (g, out) in out.chunks_mut(4).enumerate() {
+      let mut acc = [[_mm256_setzero_ps(); 2]; 4];
+      for i in (0..k).step_by(32) {
+        // SAFETY: 32 floats of `x` below k.
+        let xs = unsafe {
+          [
+            _mm256_loadu_ps(x.as_ptr().add(i)),
+            _mm256_loadu_ps(x.as_ptr().add(i + 8)),
+            _mm256_loadu_ps(x.as_ptr().add(i + 16)),
+            _mm256_loadu_ps(x.as_ptr().add(i + 24)),
+          ]
+        };
+        for (j, acc) in acc.iter_mut().enumerate() {
+          let flat = (r0 + 4 * g + j.min(out.len() - 1)) * k + i;
+          let scale = _mm256_set1_ps(d[flat / 32]);
+          let min = _mm256_set1_ps(m[flat / 32]);
+          for (half, xs) in xs.as_chunks::<2>().0.iter().enumerate() {
+            let at = flat + 16 * half;
+            // SAFETY: eight nibble bytes, weights `at..at + 16`, inside `q`. `movq` has no
+            // alignment requirement.
+            let raw = unsafe { _mm_loadl_epi64(q.as_ptr().add(at / 2).cast()) };
+            let lo = _mm_and_si128(raw, nib);
+            let hi = _mm_and_si128(_mm_srli_epi16(raw, 4), nib);
+            let seq = _mm_unpacklo_epi8(lo, hi);
+            let c0 = _mm256_cvtepi32_ps(_mm256_cvtepu8_epi32(seq));
+            let c1 = _mm256_cvtepi32_ps(_mm256_cvtepu8_epi32(_mm_srli_si128::<8>(seq)));
+            let w0 = _mm256_sub_ps(_mm256_mul_ps(c0, scale), min);
+            let w1 = _mm256_sub_ps(_mm256_mul_ps(c1, scale), min);
+            acc[0] = _mm256_fmadd_ps(w0, xs[0], acc[0]);
+            acc[1] = _mm256_fmadd_ps(w1, xs[1], acc[1]);
+          }
         }
       }
 
@@ -630,7 +742,7 @@ mod tests {
   #[test]
   fn block32_matches_dot() {
     // Grids that quantize back to themselves. Q4_0 stays on the Q8 tile; Q4_1 and Q5_1 expand.
-    // Q4_K expands too; its block is 256, so it has its own test.
+    // Q4_K stays packed; its block is 256, so it has its own test.
     // 70 rows: a full 64-row block and a short one whose last 4-row group has 2 rows.
     let (k, rows) = (64, 70);
     let x: Vec<f32> = (0..k).map(|i| (i * 31 % 17) as f32 / 8.0 - 1.0).collect();
@@ -663,19 +775,22 @@ mod tests {
 
   #[test]
   fn q4_k_matches_dot() {
-    // Two rows of 256. The expanded f32 row is the dequantized block, and the matvec matches a
-    // dot of that row.
-    let (k, rows) = (256, 2);
-    let v: Vec<f32> = (0..rows * k).map(|i| (i % 19) as f32 / 3.0 - 2.0).collect();
-    let bytes = crate::gguf::quantize_q4_k(&v);
-    let x: Vec<f32> = (0..k).map(|i| (i * 31 % 17) as f32 / 8.0 - 1.0).collect();
-    let g = Gguf::with_tensors(&[("w", &[k, rows], Type::Q4_K, &bytes)]);
-    let t = g.tensor("w", &[k, rows]).unwrap();
-    let deq = t.to_f32().unwrap();
-    let w = super::Matrix::new(&t).unwrap();
-    assert_eq!(w.row(1), deq[k..]);
-    let want: Vec<u32> = deq.chunks_exact(k).map(|r| super::dot(r, &x).to_bits()).collect();
-    let [got] = super::matvecs([(&w, &x)]);
-    assert_eq!(got.into_iter().map(f32::to_bits).collect::<Vec<_>>(), want);
+    // The packed row matches the dequantized block, and the matvec matches a dot of that row.
+    // 256×6 hits a short last group of rows. 320×4 crosses a 256-weight block inside the row.
+    for (k, rows) in [(256, 6), (320, 4)] {
+      let v: Vec<f32> = (0..rows * k).map(|i| (i % 19) as f32 / 3.0 - 2.0).collect();
+      let bytes = crate::gguf::quantize_q4_k(&v);
+      let x: Vec<f32> = (0..k).map(|i| (i * 31 % 17) as f32 / 8.0 - 1.0).collect();
+      let g = Gguf::with_tensors(&[("w", &[k, rows], Type::Q4_K, &bytes)]);
+      let t = g.tensor("w", &[k, rows]).unwrap();
+      let deq = t.to_f32().unwrap();
+      let w = super::Matrix::new(&t).unwrap();
+      for r in 0..rows {
+        assert_eq!(w.row(r), deq[r * k..(r + 1) * k], "k {k}, row {r}");
+      }
+      let want: Vec<u32> = deq.chunks_exact(k).map(|r| super::dot(r, &x).to_bits()).collect();
+      let [got] = super::matvecs([(&w, &x)]);
+      assert_eq!(got.into_iter().map(f32::to_bits).collect::<Vec<_>>(), want, "k {k}");
+    }
   }
 }

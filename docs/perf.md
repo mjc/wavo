@@ -18,8 +18,8 @@ Numbers a / b / c follow that clip order.
 
 **GigaAM.** Load reads the GGUF header and streams each tensor from the file into weight buffers
 mapped on unified memory (no staging copy), on a discrete GPU into wgpu staging buffers whose
-copies are submitted every 16 MB while the rest loads; weights stay Q8_0/F16 on the GPU, Q8_0
-scales as f16. Apart from those copies, load runs nothing on the GPU but the fast-kernel probes,
+copies are submitted every 16 MB while the rest loads; weights stay Q8_0/Q4_K/F16 on the GPU,
+Q8_0 scales as f16. Apart from those copies, load runs nothing on the GPU but the fast-kernel probes,
 in one submission. Metal caches compiled pipelines across runs by shader source, so new shaders
 cost 0.2–0.4 s once. Per call: CPU log-mel
 (own FFT, one frame at a time), then the encoder over an arena sized for the longest input so far,
@@ -46,8 +46,10 @@ the 63 position rows of a 32 × 32 block and indexes each score's row directly. 
 longest T so far; its 2T + 15 rows are written per call. Subsampling runs in 8 chunks of output
 rows, with conv0 + ReLU fused into the first depthwise conv and the pointwise convs through the
 GEMM; BatchNorm is folded into a per-channel affine at load. The TDT loop and two LSTM layers run
-on the CPU over Q8_0 weights (`cpu::Q8`: int8 values and an f32 scale per 32) dequantized in NEON
-registers; `q·d` is exact in f32 and the lanes are `dot`'s, so results equal the F32 path bit for
+on the CPU. Q8_0 stays packed (`cpu::Q8`: int8 values and an f32 scale per 32) and is dequantized
+in NEON or AVX2 registers. Q4_K stays packed (`cpu::Q4K`: nibbles, and `d·scale` and `dmin·min`
+as f32 per 32) and is dequantized in AVX2 registers, or one row at a time elsewhere. `q·d` and
+`code·d − m` are exact in f32 and the lanes are `dot`'s, so results equal the F32 path bit for
 bit. A step's LSTM (6.6 MB) and V3 joint (5.2 MB) fit in the performance cores' 16 MB L2. Each
 product goes out in blocks of 64 rows to four scoped threads that take the next block when free
 (`matvecs`); a layer's `Wx·x` and `Wh·h` share one queue.
@@ -197,6 +199,26 @@ Each entry sits under its topic, newest first: date, model, what was tried, the 
 two numbers (A/B/A, warm median unless stated), kept or rejected and why.
 
 ### GEMM
+
+- 2026-11-18, Parakeet Ultra and GigaAM v3 RNN-T, portable GEMM on an RX 5700 XT (RADV NAVI10).
+  Every weight type stages the rounded K tile as f16 pairs, and Q4_K computes 64 columns per
+  workgroup instead of 128. `wavo bench -n 10`, warm medians, previous / this / previous: Q4
+  Ultra `jfk` 103.3 / 96.4 / 103.7, `dots` 246.6 / 249.9 / 252.8; GigaAM Q4 `ru-short` 52.8 /
+  50.2 / 52.9, `ru-long` 131.6 / 124.6 / 132.1. Q8 Ultra `jfk` 113.4 / 108.9 / 112.4, GigaAM Q8
+  `ru-long` 140.8 / 128.3 / 142.7 ms. The two previous runs agreed. Ultra `dots` stayed inside
+  that spread. Parakeet and GigaAM `jfk`, `dots`, `ru`, `ru-short`, `ru-long` match the previous
+  Q4 text. Kept. The cooperative-matrix GEMM is unchanged.
+
+- 2026-11-18, Parakeet Ultra and GigaAM v3 RNN-T Q4_K_M, portable GEMM on an RX 5700 XT (RADV
+  NAVI10). The upload stores each group's `d·scale` and `dmin·min` as f32, and the K tile keeps
+  the rounded weights as f16 pairs instead of f32. `wavo bench -n 10`, warm medians, Q8 / Q4 /
+  Q8: Ultra `jfk` 111.5 / 102.3 / 111.6, `dots` 267.8 / 251.2 / 264.6; GigaAM `ru-short` 56.5 /
+  52.9 / 56.8, `ru-long` 140.5 / 129.7 / 140.5 ms. A `wavo serve whisper-medium` was already
+  resident; the two Q8 runs still agreed. Staging those weights as f32 left GigaAM tied
+  (`ru-long` 142.1 / 142.1 / 142.5) and Ultra about 3 ms ahead. `q4_k_gemm` matches. Parakeet
+  `jfk`, `dots`, `ru`, `ru-short`, `ru-long` and GigaAM `ru`, `ru-short`, `ru-long` match the
+  Q8 text and the Q4 text saved before this change. GigaAM `jfk` and `dots` differ from Q8.
+  Kept. The cooperative-matrix GEMM is unchanged.
 
 - 2026-11-07, all models, the portable GEMM rounds `a` to f16 as `kernel_mul_mm` does (PR #88):
   without it ivrit he-long gave `החללה` where the fixture has `החלאה`, a near-tie. This reverses
@@ -517,6 +539,13 @@ first call 11.2 / 12.5 s, load 1.3–1.6 s, 0.55 GB (2 / 4 cores).
   3.7 / 3.3 s. Kept; int8 activations, as faster-whisper's, rejected above.
 
 ### CPU decoders
+
+- 2026-11-18, Parakeet Ultra, Q4_K decoder weights stay packed: nibbles in weight order and the
+  f32 products `d·scale` and `dmin·min` per 32. The AVX2 tile uses `dot`'s 16-wide FMAs and
+  matches it bit for bit, including a short last group of rows (`256×6`) and a row that crosses
+  a block (`320×4`). Packing the decoder rows while the K tile was still f32 put Ultra about 3 ms
+  ahead of Q8 on `jfk` and `dots`, and GigaAM did not move. Kept with that GEMM change.
+  GigaAM's decoder still expands both quants to f32.
 
 - 2026-10-10, all models, x86_64: runtime-dispatched AVX2 + FMA versions of the decoder tiles and
   `Q8::rows`, bit-identical. N100 default build decoder ru-long 1243 → 55, dots 2031 → 236 ms;
