@@ -3,7 +3,6 @@
 //! Conformer blocks with relative positions and the joint's encoder projection.
 
 use super::encoder_frames;
-use super::frontend::MELS;
 use crate::conformer::{self, rel_positions};
 use crate::cpu::conformer::Conformer;
 use crate::cpu::gemm::{Linear, gemm};
@@ -22,6 +21,7 @@ type Taps = (Vec<f32>, Vec<f32>);
 pub struct Encoder {
   /// Subsampling channels.
   ch: usize,
+  mels: usize,
   conv0: Taps,
   conv2: Taps,
   conv3: Linear,
@@ -33,7 +33,13 @@ pub struct Encoder {
 }
 
 impl Encoder {
-  pub fn new(g: &Gguf, cfg: conformer::Config, ch: usize, joint: usize) -> Result<Self> {
+  pub fn new(
+    g: &Gguf,
+    cfg: conformer::Config,
+    ch: usize,
+    joint: usize,
+    mels: usize,
+  ) -> Result<Self> {
     let d = cfg.d;
     let f32s = |name: String, dims: &[usize]| g.tensor(&name, dims)?.to_f32();
     // Weights from [ch][time tap][frequency tap] to [tap][ch].
@@ -49,24 +55,25 @@ impl Encoder {
     };
     Ok(Self {
       ch,
+      mels,
       conv0: conv(0)?,
       conv2: conv(2)?,
       conv3: linear("enc.pre_encode.conv.3", &[1, 1, ch, ch])?,
       conv5: conv(5)?,
       conv6: linear("enc.pre_encode.conv.6", &[1, 1, ch, ch])?,
-      out: linear("enc.pre_encode.out", &[ch * half(half(half(MELS))), d])?,
+      out: linear("enc.pre_encode.out", &[ch * half(half(half(mels))), d])?,
       conformer: Conformer::load(g, cfg)?,
       joint: linear("joint.enc", &[d, joint])?,
     })
   }
 
-  /// Encodes `mel` `[mel frames][MELS]` and returns the joint's encoder projections, one row per
+  /// Encodes `mel` `[mel frames][mels]` and returns the joint's encoder projections, one row per
   /// encoder frame (`encoder_frames`), with their width. With `valid` less than the mel frames,
   /// the frames past it are padding, masked as `encoder.rs` masks them.
   pub fn run(&self, mel: &[f32], valid: usize) -> (Vec<f32>, usize) {
-    let ch = self.ch;
-    let (t2, f2) = (half(half(mel.len() / MELS)), half(half(MELS)));
-    let (t, f, d) = (encoder_frames(mel.len() / MELS), half(f2), self.conformer.cfg.d);
+    let (ch, mels) = (self.ch, self.mels);
+    let (t2, f2) = (half(half(mel.len() / mels)), half(half(mels)));
+    let (t, f, d) = (encoder_frames(mel.len() / mels), half(f2), self.conformer.cfg.d);
     // A chunk of conv2's output rows from 2·t0 − 1 on, then conv3's.
     let mut a = vec![0.0; (2 * CHUNK + 1) * f2 * ch];
     let mut b = vec![0.0; a.len()];
@@ -75,7 +82,7 @@ impl Encoder {
       let n = CHUNK.min(t - t0);
       let rows = 2 * n + 1;
       let (a, b) = (&mut a[..rows * f2 * ch], &mut b[..rows * f2 * ch]);
-      self.first(mel, valid, a, t0);
+      self.first(mel, valid, a, t0, mels);
       gemm(a, &self.conv3, b, rows * f2, Epilogue::Relu);
       depthwise(b, &self.conv5, [t2, f2, ch], &mut h[t0 * f * ch..][..n * f * ch], t0);
     }
@@ -98,11 +105,11 @@ impl Encoder {
   }
 
   /// conv0 + ReLU over the valid mel frames, then conv2, into `y`: its output rows from
-  /// 2·`t0` − 1 on `[rows][MELS / 4][ch]`, those from ⌈valid / 4⌉ on zero, as if masked. conv0's
+  /// 2·`t0` − 1 on `[rows][mels / 4][ch]`, those from ⌈valid / 4⌉ on zero, as if masked. conv0's
   /// rows are computed per output row and never stored whole.
-  fn first(&self, mel: &[f32], valid: usize, y: &mut [f32], t0: usize) {
+  fn first(&self, mel: &[f32], valid: usize, y: &mut [f32], t0: usize, mels: usize) {
     let ch = self.ch;
-    let (t1, f1) = (half(valid), half(MELS));
+    let (t1, f1) = (half(valid), half(mels));
     let f2 = half(f1);
     let ((w0, b0), (w2, b2)) = (&self.conv0, &self.conv2);
     par_each(
@@ -121,7 +128,7 @@ impl Encoder {
             px.copy_from_slice(b0);
             for (tap, w) in w0.chunks_exact(ch).enumerate() {
               let (tm, fm) = ((2 * r + tap / 3).wrapping_sub(1), (2 * c + tap % 3).wrapping_sub(1));
-              let x = if tm < valid && fm < MELS { mel[tm * MELS + fm] } else { 0.0 };
+              let x = if tm < valid && fm < mels { mel[tm * mels + fm] } else { 0.0 };
               px.iter_mut().zip(w).for_each(|(p, w)| *p += w * x);
             }
 

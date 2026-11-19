@@ -8,7 +8,7 @@
 //! conv2 and the extent mask `e2` after conv3.
 
 use super::encoder_frames;
-use super::frontend::{HOP, MELS};
+use super::frontend::HOP;
 use crate::ane::{self, Graph, Program, Var};
 use crate::error::Result;
 use crate::gguf::Gguf;
@@ -21,8 +21,9 @@ const T2: usize = half(T1);
 const T: usize = half(T2);
 
 pub fn build(g: &Gguf, p: &mut Program) -> Result<Vec<Var>> {
-  let (cfg, ch, joint) = super::config(g)?;
-  let mel = p.input("mel", &[1, 1, MEL_FRAMES, MELS]);
+  let spec = super::config(g)?;
+  let (cfg, ch, joint, mels) = (spec.cfg, spec.ch, spec.joint, spec.mels);
+  let mel = p.input("mel", &[1, 1, MEL_FRAMES, mels]);
   let m1 = p.input("m1", &[1, 1, T1, 1]);
   let m2 = p.input("m2", &[1, 1, T2, 1]);
   let e2 = p.input("e2", &[1, 1, T2, 1]);
@@ -48,7 +49,7 @@ pub fn build(g: &Gguf, p: &mut Program) -> Result<Vec<Var>> {
   let x = gr.binary("mul", &x, &e2);
   let x = conv(&mut gr, &x, 5, false)?;
   let x = conv(&mut gr, &x, 6, true)?;
-  let x = gr.unary("relu", &x); // [1][ch][T][MELS / 8]
+  let x = gr.unary("relu", &x); // [1][ch][T][mels / 8]
   let f = x.shape[3];
   let x = gr.transpose(&x, &[0, 2, 1, 3]);
   let x = gr.reshape(&x, &[T, ch * f]);
@@ -59,19 +60,24 @@ pub fn build(g: &Gguf, p: &mut Program) -> Result<Vec<Var>> {
   Ok(vec![out])
 }
 
-/// Runs the program on `mel` `[frames][MELS]` (at most the window's), of which the first `valid`
+/// Runs the program on `mel` `[frames][mels]` (at most the window's), of which the first `valid`
 /// the subsampling keeps (all but the last with kestrel masking), and returns the joint's encoder
 /// projections `[encoder_frames][width]` with their width.
-pub fn run(model: &ane::Model, mel: &[f32], valid: usize) -> Result<(Vec<f32>, usize)> {
-  let frames = mel.len() / MELS;
+pub fn run(
+  model: &ane::Model,
+  mel: &[f32],
+  valid: usize,
+  mels: usize,
+) -> Result<(Vec<f32>, usize)> {
+  let frames = mel.len() / mels;
   let (n1, n2, n3) = (half(valid), half(half(valid)), encoder_frames(frames));
-  let mut padded = mel[..valid * MELS].to_vec();
-  padded.resize(MEL_FRAMES * MELS, 0.0);
+  let mut padded = mel[..valid * mels].to_vec();
+  padded.resize(MEL_FRAMES * mels, 0.0);
   let (m1, m2, m3) = (ane::mask(T1, n1), ane::mask(T2, n2), ane::mask(T, n3));
   let (e2, keys) = (ane::mask(T2, half(half(frames))), ane::key_mask(T, n3));
   let out = model.predict(
     &[
-      ("mel", &[1, 1, MEL_FRAMES, MELS], &padded),
+      ("mel", &[1, 1, MEL_FRAMES, mels], &padded),
       ("m1", &[1, 1, T1, 1], &m1),
       ("m2", &[1, 1, T2, 1], &m2),
       ("e2", &[1, 1, T2, 1], &e2),
