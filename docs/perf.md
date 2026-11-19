@@ -198,6 +198,13 @@ two numbers (A/B/A, warm median unless stated), kept or rejected and why.
 
 ### GEMM
 
+- 2026-11-19, Whisper Q5_K: store the GPU codes as bytes 0..31, 256 per block, and load a quad with
+  `unpack4xI8`. On the Apple M1 nibble binary, turbo Q5 / Q4 / Q5 was 2136.6 / 2080.4 / 2132.3 ms.
+  `jfk`, warm median of 10. Apple M1, nibbles / bytes / nibbles: turbo 2131.5 / 1988.1 / 2136.6 ms,
+  large-v3 2983.6 / 2903.0 / 2981.4 ms. RX 5700 XT, nibbles / bytes / nibbles: large-v3
+  815.6 / 813.8 / 812.8 ms, turbo 587.2 / 579.8 / 576.7 ms. Transcripts match Q8. The two layouts
+  tie on the 5700 XT. Kept.
+
 - 2026-11-18, Apple M1, Metal 8×8 kernels, the Q5_K nibble plane unchanged. `jfk`, warm median of 10.
   Q8 / Q5 / Q8: turbo 1934.1 / 2143.4 / 1945.3 ms, large-v3 2833.2 / 2986.3 / 2838.2 ms.
   `WAVO_KERNELS=matrix8` on turbo Q5 was 2133.5 ms. Transcripts match Q8.
