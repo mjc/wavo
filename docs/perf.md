@@ -198,6 +198,12 @@ two numbers (A/B/A, warm median unless stated), kept or rejected and why.
 
 ### GEMM
 
+- 2026-11-18, Whisper large-v3 Q5_K: timestamp each dispatch in its own pass on `jfk` (RX 5700 XT,
+  one warm call; the sums run a little high). One call's gemv is Q8 93.8 ms, Q4_K 103.6, Q5_K 119.2.
+  Attention and the other kernels match, about 194 ms. Encoder GEMMs are Q8 454 ms, Q4_K 460, Q5_K
+  463. The wall gap is that gemv. The 5-bit pack already cost more than these extra code bytes.
+  No shader change.
+
 - 2026-11-18, Whisper Q5_K: upload the codes as bytes 0..31, 256 per block, instead of the
   Q5_0 5-bit pack. The gemv spent the difference on that extract. RX 5700 XT, `jfk`, warm
   median. 5-bit pack, Q8 / Q5 / Q4 / Q8: turbo 554.9 / 576.9 / 552.9 / 545.3, large-v3
