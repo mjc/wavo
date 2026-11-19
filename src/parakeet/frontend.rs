@@ -20,8 +20,10 @@ const BINS: usize = N_FFT / 2 + 1;
 const LOG_EPS: f32 = 1.0 / (1 << 24) as f32;
 
 pub struct Frontend {
+  /// Mel bins: 128, or 80 for parakeet-tdt-1.1b.
+  pub(crate) mels: usize,
   window: Vec<f64>,
-  /// `[MELS][BINS]`
+  /// `[mels][BINS]`
   filters: Vec<f32>,
   /// Per filter, its nonzero bins.
   spans: Vec<Range<usize>>,
@@ -29,7 +31,7 @@ pub struct Frontend {
 }
 
 impl Frontend {
-  pub fn new() -> Self {
+  pub fn new(mels: usize) -> Self {
     let pad = (N_FFT - WINDOW) / 2;
     let window = (0..N_FFT)
       .map(|i| match i.wrapping_sub(pad) {
@@ -37,17 +39,17 @@ impl Frontend {
         _ => 0.0,
       })
       .collect();
-    let filters = slaney_filterbank();
+    let filters = slaney_filterbank(mels);
     let spans = (filters.as_chunks::<BINS>().0.iter())
       .map(|f| {
         let lo = f.iter().position(|&w| w != 0.0).unwrap_or(0);
         lo..f.iter().rposition(|&w| w != 0.0).map_or(lo, |i| i + 1)
       })
       .collect();
-    Self { window, filters, spans, fft: Fft::new(N_FFT) }
+    Self { mels, window, filters, spans, fft: Fft::new(N_FFT) }
   }
 
-  /// Features of 16 kHz PCM, time-major `[pcm.len() / 160 + 1][MELS]`; empty below 3 frames, too
+  /// Features of 16 kHz PCM, time-major `[pcm.len() / 160 + 1][mels]`; empty below 3 frames, too
   /// few for the normalization.
   pub fn compute(&self, pcm: &[f32]) -> Vec<f32> {
     let frames = pcm.len() / HOP + 1;
@@ -57,21 +59,21 @@ impl Frontend {
 
     let mut mel = self.log_mel(pcm, 0..frames);
     // Unbiased statistics over all frames but the last.
-    let n = frames - 1;
-    for m in 0..MELS {
-      let column = || (0..n).map(|t| mel[t * MELS + m] as f64);
+    let (n, mels) = (frames - 1, self.mels);
+    for m in 0..mels {
+      let column = || (0..n).map(|t| mel[t * mels + m] as f64);
       let mean = column().sum::<f64>() / n as f64;
       let var = column().map(|x| (x - mean) * (x - mean)).sum::<f64>() / (n - 1) as f64;
       let inv = 1.0 / (var.sqrt() + 1e-5f32 as f64);
       for t in 0..n {
-        mel[t * MELS + m] = ((mel[t * MELS + m] as f64 - mean) * inv) as f32;
+        mel[t * mels + m] = ((mel[t * mels + m] as f64 - mean) * inv) as f32;
       }
-      mel[n * MELS + m] = 0.0;
+      mel[n * mels + m] = 0.0;
     }
     mel
   }
 
-  /// The log-mel of `frames`, time-major `[frames.len()][MELS]`: frames of the whole `pcm`, up to
+  /// The log-mel of `frames`, time-major `[frames.len()][mels]`: frames of the whole `pcm`, up to
   /// `pcm.len() / 160 + 1` of them, computed from only the samples they cover.
   pub fn log_mel(&self, pcm: &[f32], frames: Range<usize>) -> Vec<f32> {
     // Samples `pad - N_FFT / 2..` of the pre-emphasized audio with N_FFT / 2 zeros on each side.
@@ -84,7 +86,7 @@ impl Frontend {
         _ => 0.0,
       })
       .collect();
-    let mut mel = Vec::with_capacity(frames.len() * MELS);
+    let mut mel = Vec::with_capacity(frames.len() * self.mels);
     let (mut frame, mut buf) = ([0f64; N_FFT], [0f64; 4 * N_FFT]);
     let mut power = [0f32; BINS];
     for t in 0..frames.len() {
@@ -108,9 +110,9 @@ impl Frontend {
   }
 }
 
-/// librosa's `mel(sr=16000, n_fft=512, n_mels=128, fmin=0, fmax=8000, norm='slaney')` as
+/// librosa's `mel(sr=16000, n_fft=512, n_mels, fmin=0, fmax=8000, norm='slaney')` as
 /// `build_mel_filterbank_slaney` in transcribe.cpp's `src/transcribe-mel.cpp` computes it.
-fn slaney_filterbank() -> Vec<f32> {
+fn slaney_filterbank(mels: usize) -> Vec<f32> {
   const FSP: f64 = 200.0 / 3.0;
   const MIN_LOG_HZ: f64 = 1000.0;
   let min_log_mel = MIN_LOG_HZ / FSP;
@@ -123,8 +125,8 @@ fn slaney_filterbank() -> Vec<f32> {
   };
   let mel_max = hz_to_mel(F_MAX as f64);
   let hz: Vec<f64> =
-    (0..MELS + 2).map(|m| mel_to_hz(mel_max * m as f64 / (MELS + 1) as f64)).collect();
-  let mut out = vec![0f32; MELS * BINS];
+    (0..mels + 2).map(|m| mel_to_hz(mel_max * m as f64 / (mels + 1) as f64)).collect();
+  let mut out = vec![0f32; mels * BINS];
   for (m, row) in out.as_chunks_mut::<BINS>().0.iter_mut().enumerate() {
     let enorm = 2.0 / (hz[m + 2] - hz[m]);
     for (k, w) in row.iter_mut().enumerate() {
@@ -141,17 +143,20 @@ fn slaney_filterbank() -> Vec<f32> {
 mod tests {
   #[test]
   fn short_input() {
-    let frontend = super::Frontend::new();
+    let frontend = super::Frontend::new(super::MELS);
     assert!(frontend.compute(&[0.1; 319]).is_empty());
     let mel = frontend.compute(&[0.1; 320]);
     assert_eq!(mel.len(), 3 * super::MELS);
     assert!(mel.iter().all(|x| x.is_finite()));
+    let eighty = super::Frontend::new(80).compute(&[0.1; 320]);
+    assert_eq!(eighty.len(), 3 * 80);
+    assert!(eighty.iter().all(|x| x.is_finite()));
   }
 
   /// A range of frames is the same as those frames of the whole audio, at the edges too.
   #[test]
   fn frame_ranges() {
-    let frontend = super::Frontend::new();
+    let frontend = super::Frontend::new(super::MELS);
     let pcm: Vec<f32> = (0..16_000).map(|i| (i as f32 * 0.01).sin() * 0.5).collect();
     let all = frontend.log_mel(&pcm, 0..101);
     for r in [0..1, 0..7, 3..40, 95..101, 100..101] {

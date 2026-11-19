@@ -95,7 +95,7 @@ impl Sortformer {
     let gpu = |gpu: &Gpu| Encoder::new(gpu, g, cfg, [width, speakers, frames], &table);
     let cpu = || cpu::Encoder::new(g, cfg, width, speakers, table.clone());
     let backend = Backend::new(target, gpu, cpu)?;
-    Ok(Self { frontend: Frontend::new(), backend, silence, speakers })
+    Ok(Self { frontend: Frontend::new(MELS), backend, silence, speakers })
   }
 
   pub fn device(&self) -> &Device {

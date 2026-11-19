@@ -560,6 +560,11 @@ fn parakeet_tdt_v2() {
 }
 
 #[test]
+fn parakeet_tdt_1_1b() {
+  check("parakeet-tdt-1.1b", &["jfk", "jobs-silence"]);
+}
+
+#[test]
 fn parakeet_tdt_v3() {
   check("parakeet-tdt-0.6b-v3", &["jfk", "ru-short", "uk-short"]);
   long("parakeet-tdt-0.6b-v3", "jfk", false);
