@@ -42,8 +42,8 @@ var<immediate> p: Params;
 // 5-bit codes (24 bytes per 32), Q4_K as nibbles (128 bytes per 256).
 @group(0) @binding(3) var<storage, read> w: array<u32>;
 // Q8_0, Q5_0 and Q4_0: one f16 scale per block, two per word. Q4_1 and Q5_1: an f16 scale and an
-// f16 minimum, one pair per word. Q4_K: 20 bytes per 256 weights (f16 scale, f16 minimum, eight
-// scales, eight minimums). Any buffer for the other types.
+// f16 minimum, one pair per word. Q4_K: eight f32 pairs per 256 weights, `d·scale` and `dmin·min`
+// for each group of 32, formed at upload. Any buffer for the other types.
 @group(0) @binding(4) var<storage, read> scales: array<u32>;
 // `a` for the GEMM's 16-byte loads.
 @group(0) @binding(0) var<storage, read> a4: array<vec4<f32>>;
@@ -194,25 +194,16 @@ fn q51_at(row: u32, col: u32) -> vec4<f32> {
   );
 }
 
-// Four Q4_K codes at weight x (a multiple of 4). Nibbles are in weight order, 128 bytes per 256.
+// Four Q4_K codes at weight x (a multiple of 4). Nibbles are in weight order, eight per word.
 fn q4k_codes4(x: u32) -> vec4<f32> {
-  let block = x / 256u;
-  let local = x % 256u;
-  let word = w[block * 32u + local / 8u];
-  let bits = (word >> ((local % 8u) * 4u)) & 0xFFFFu;
+  let bits = (w[x >> 3u] >> ((x & 4u) << 2u)) & 0xFFFFu;
   return vec4(f32(bits & 15u), f32((bits >> 4u) & 15u), f32((bits >> 8u) & 15u), f32((bits >> 12u) & 15u));
 }
 
-// `d · scale` and `dmin · min` for the group of 32 that contains x.
+// `d · scale` and `dmin · min` for the group of 32 that contains x. Upload stored the product.
 fn q4k_dm(x: u32) -> vec2<f32> {
-  let block = x / 256u;
-  let sub = (x % 256u) / 32u;
-  let base = block * 5u;
-  let hd = unpack2x16float(scales[base]);
-  let shift = (sub % 4u) * 8u;
-  let scale = (scales[base + 1u + sub / 4u] >> shift) & 255u;
-  let min = (scales[base + 3u + sub / 4u] >> shift) & 255u;
-  return vec2(hd.x * f32(scale), hd.y * f32(min));
+  let i = (x >> 5u) << 1u;
+  return vec2(bitcast<f32>(scales[i]), bitcast<f32>(scales[i + 1u]));
 }
 
 fn q4k_4(x: u32) -> vec4<f32> {
@@ -233,6 +224,9 @@ fn lane(v: vec4<f32>, x: u32) -> f32 {
 // [32][128] tile of W as [k][column quad].
 var<workgroup> at: array<vec4<f32>, 576>;
 var<workgroup> wt: array<vec4<f32>, 1024>;
+// Q4_K stores the same to_half weights as two f16 pairs. The inner loop unpacks them. Other types
+// keep f32 in `wt`.
+var<workgroup> wt16: array<vec2<u32>, 1024>;
 
 // GELU with erf as ggml-metal computes it: `erf_approx` (Abramowitz–Stegun 7.1.26) in
 // ggml/src/ggml-metal/kernels/common.h, `0.5·x·(1 + erf(x/√2))` in unary.metal.
@@ -374,10 +368,17 @@ fn gemm(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_index) l
     let x1 = w_floats(f.w1);
     let x2 = w_floats(f.w2);
     let x3 = w_floats(f.w3);
-    wt[kq * 32u + r] = vec4(x0.x, x1.x, x2.x, x3.x);
-    wt[(kq + 1u) * 32u + r] = vec4(x0.y, x1.y, x2.y, x3.y);
-    wt[(kq + 2u) * 32u + r] = vec4(x0.z, x1.z, x2.z, x3.z);
-    wt[(kq + 3u) * 32u + r] = vec4(x0.w, x1.w, x2.w, x3.w);
+    if (WTYPE == 7u) {
+      wt16[kq * 32u + r] = vec2(pack2x16float(vec2(x0.x, x1.x)), pack2x16float(vec2(x2.x, x3.x)));
+      wt16[(kq + 1u) * 32u + r] = vec2(pack2x16float(vec2(x0.y, x1.y)), pack2x16float(vec2(x2.y, x3.y)));
+      wt16[(kq + 2u) * 32u + r] = vec2(pack2x16float(vec2(x0.z, x1.z)), pack2x16float(vec2(x2.z, x3.z)));
+      wt16[(kq + 3u) * 32u + r] = vec2(pack2x16float(vec2(x0.w, x1.w)), pack2x16float(vec2(x2.w, x3.w)));
+    } else {
+      wt[kq * 32u + r] = vec4(x0.x, x1.x, x2.x, x3.x);
+      wt[(kq + 1u) * 32u + r] = vec4(x0.y, x1.y, x2.y, x3.y);
+      wt[(kq + 2u) * 32u + r] = vec4(x0.z, x1.z, x2.z, x3.z);
+      wt[(kq + 3u) * 32u + r] = vec4(x0.w, x1.w, x2.w, x3.w);
+    }
     if (k0 + 32u < p.k) {
       f = fetch(m0, n0, k0 + 32u, lid);
     }
@@ -392,8 +393,17 @@ fn gemm(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_index) l
         a3 = at[(ty + 48u) * 9u + kq];
       }
       for (var j = 0u; j < 4u; j++) {
-        let b0 = wt[(4u * kq + j) * 32u + tx];
-        let b1 = wt[(4u * kq + j) * 32u + 16u + tx];
+        var b0: vec4<f32>;
+        var b1: vec4<f32>;
+        if (WTYPE == 7u) {
+          let p0 = wt16[(4u * kq + j) * 32u + tx];
+          let p1 = wt16[(4u * kq + j) * 32u + 16u + tx];
+          b0 = vec4(unpack2x16float(p0.x), unpack2x16float(p0.y));
+          b1 = vec4(unpack2x16float(p1.x), unpack2x16float(p1.y));
+        } else {
+          b0 = wt[(4u * kq + j) * 32u + tx];
+          b1 = wt[(4u * kq + j) * 32u + 16u + tx];
+        }
         c00 += a0[j] * b0;
         c01 += a0[j] * b1;
         c10 += a1[j] * b0;
