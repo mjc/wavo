@@ -16,6 +16,7 @@ mod models;
 mod output;
 mod serve;
 mod split;
+mod subtitles;
 
 use std::ops::ControlFlow;
 use std::path::{Path, PathBuf};
@@ -84,8 +85,9 @@ Serve options:
   response_format (json, text, srt, vtt, verbose_json, diarized_json); GET /v1/models lists
   the downloaded models, GET /health the GPU and the loaded models. A downloaded model not
   listed loads on first use, one at a time; so does nemotron-diarization for diarized_json,
-  unless listed (then it is downloaded as the others are). POST /asr, POST /detect-language and GET /status answer as
-  whisper-asr-webservice does, for Bazarr's subtitles, with the first model.
+  unless listed (then it is downloaded as the others are). POST /asr, POST /detect-language
+  and GET /status answer as whisper-asr-webservice does, for Bazarr's subtitles, with the
+  first model.
 
 MODEL is a name below, its full name or a path to a .gguf file (for serve, a name); for
 nemotron-diarization, wavo run prints who speaks when (as text or --json), up to 8 speakers
@@ -214,6 +216,13 @@ fn ask(question: &str) -> bool {
 }
 
 fn load(path: &Path, backend: Backend) -> Result<wavo::Model> {
+  // A GPU this user may not open, as in a container without --group-add: once, not per load.
+  #[cfg(target_os = "linux")]
+  if backend != Backend::Cpu {
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    ONCE.call_once(|| debug::denied().into_iter().for_each(|w| eprintln!("warning: {w}")));
+  }
+
   wavo::Model::load_with(path, backend).with_context(|| format!("loading {}", path.display()))
 }
 
@@ -421,8 +430,8 @@ fn run(args: &[&str]) -> Result<()> {
 
   let text = match (format, &utterances) {
     (Some("--json"), _) => output::json(&transcript, utterances.as_deref()) + "\n",
-    (Some(_), Some(u)) => output::srt(&output::speaker_cues(tokens, &starts, u, ms, timed)),
-    (Some(_), None) => output::srt(&output::cues(tokens, &starts, ms, timed)),
+    (Some(_), Some(u)) => subtitles::srt(&subtitles::speaker_cues(tokens, &starts, u, ms, timed)),
+    (Some(_), None) => subtitles::srt(&subtitles::cues(tokens, &starts, ms, timed)),
     (None, Some(u)) => output::by_speaker(u),
     (None, None) if transcript.text.is_empty() => String::new(),
     (None, None) => format!("{}\n", transcript.text),
