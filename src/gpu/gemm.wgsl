@@ -40,7 +40,7 @@ var<immediate> p: Params;
 @group(0) @binding(2) var<storage, read_write> c: array<f32>;
 // F32 as bits, F16 as pairs, Q8_0 as 4 int8 per word, Q4 as nibbles (16 bytes per 32), Q5 as
 // 5-bit codes (24 bytes per 32), Q4_K as nibbles (128 bytes per 256), Q6_K as i8 codes already
-// minus 32 (256 bytes per 256), Q5_K as the same 5-bit codes (192 bytes per 256).
+// minus 32 (256 bytes per 256), Q5_K as bytes 0..31 (256 bytes per 256).
 @group(0) @binding(3) var<storage, read> w: array<u32>;
 // Q8_0, Q5_0 and Q4_0: one f16 scale per block, two per word. Q4_1 and Q5_1: an f16 scale and an
 // f16 minimum, one pair per word. Q4_K: 20 bytes per 256 weights (f16 scale, f16 minimum, eight
@@ -239,11 +239,14 @@ fn q6k_4(x: u32) -> vec4<f32> {
   return codes * (d * sc);
 }
 
-// Four Q5_K weights at x (a multiple of 4). Codes are 0..31 in the Q5_0 layout, 24 bytes per 32.
-// The scale record is the same one Q4_K uses.
+// Four Q5_K weights at x (a multiple of 4). Codes are bytes 0..31 in weight order, so one word
+// holds four. The scale record is the same one Q4_K uses.
 fn q5k_4(x: u32) -> vec4<f32> {
+  let block = x / 256u;
+  let local = x % 256u;
+  let codes = vec4<f32>(unpack4xI8(w[block * 64u + local / 4u]));
   let s = q4k_dm(x);
-  return q5_codes4(x) * s.x - s.y;
+  return codes * s.x - s.y;
 }
 
 fn lane(v: vec4<f32>, x: u32) -> f32 {

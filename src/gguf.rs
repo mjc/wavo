@@ -290,17 +290,6 @@ pub(crate) fn q5k_codes(block: &[u8; 176]) -> [u8; 256] {
   codes
 }
 
-/// Q5_K codes in the same 5-bit layout as Q5_0, 24 bytes per 32 weights.
-pub(crate) fn q5k_packed(block: &[u8; 176]) -> [u8; 192] {
-  let codes = q5k_codes(block);
-  let mut out = [0u8; 192];
-  for g in 0..8 {
-    let group: [u8; 32] = codes[g * 32..g * 32 + 32].try_into().unwrap();
-    out[g * 24..g * 24 + 24].copy_from_slice(&pack5(group));
-  }
-  out
-}
-
 /// Superblock f16 scale and minimum, then the eight decoded scales and eight decoded minimums.
 /// The first 16 bytes match a Q4_K block.
 pub(crate) fn q5k_scales(block: &[u8; 176]) -> [u8; 20] {
@@ -1996,17 +1985,6 @@ mod tests {
     let block = q5k_block(0.5, 0.25, &scale, &min, &codes);
 
     assert_eq!(q5k_codes(&block), codes);
-    let packed = q5k_packed(&block);
-    for g in 0..8 {
-      let chunk = &packed[g * 24..g * 24 + 24];
-      for i in 0..32 {
-        let bit = i * 5;
-        let byte = bit / 8;
-        let word = u16::from_le_bytes([chunk[byte], chunk[byte + 1]]);
-        let code = ((word >> (bit % 8)) & 31) as u8;
-        assert_eq!(code, codes[g * 32 + i], "group {g} lane {i}");
-      }
-    }
     let rec = q5k_scales(&block);
     let d = f16::from_f32(0.5);
     let dmin = f16::from_f32(0.25);

@@ -198,6 +198,12 @@ two numbers (A/B/A, warm median unless stated), kept or rejected and why.
 
 ### GEMM
 
+- 2026-11-18, Whisper Q5_K: upload the codes as bytes 0..31, 256 per block, instead of the
+  Q5_0 5-bit pack. The gemv spent the difference on that extract. RX 5700 XT, `jfk`, warm
+  median. 5-bit pack, Q8 / Q5 / Q4 / Q8: turbo 554.9 / 576.9 / 552.9 / 545.3, large-v3
+  768.0 / 859.2 / 781.1 / 761.4. Bytes, Q8 / Q5 / Q8: turbo 545.3 / 556.6 / 545.8, large-v3
+  762.2 / 795.7 / 762.2. Both Q5 transcripts match Q8. Kept.
+
 - 2026-11-07, all models, the portable GEMM rounds `a` to f16 as `kernel_mul_mm` does (PR #88):
   without it ivrit he-long gave `החללה` where the fixture has `החלאה`, a near-tie. This reverses
   the rejection of rounding `a` in the 2026-10-09 entry on rounding W below, now that a fixture

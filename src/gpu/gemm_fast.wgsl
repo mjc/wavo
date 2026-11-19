@@ -227,8 +227,11 @@ fn q6k_4(x: u32) -> vec4<f32> {
 
 // Same Q5_K load as gemm.wgsl. This module is not concatenated with that one.
 fn q5k_4(x: u32) -> vec4<f32> {
+  let block = x / 256u;
+  let local = x % 256u;
+  let codes = vec4<f32>(unpack4xI8(w[block * 64u + local / 4u]));
   let s = q4k_dm(x);
-  return q5_codes4(x) * s.x - s.y;
+  return codes * s.x - s.y;
 }
 
 // Stages a[m0 + i / (KS / 4)][k0 + i % (KS / 4) · 4 ..+4].
