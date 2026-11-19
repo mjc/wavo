@@ -198,6 +198,10 @@ two numbers (A/B/A, warm median unless stated), kept or rejected and why.
 
 ### GEMM
 
+- 2026-11-18, Apple M1, Metal 8×8 kernels, the Q5_K nibble plane unchanged. `jfk`, warm median of 10.
+  Q8 / Q5 / Q8: turbo 1934.1 / 2143.4 / 1945.3 ms, large-v3 2833.2 / 2986.3 / 2838.2 ms.
+  `WAVO_KERNELS=matrix8` on turbo Q5 was 2133.5 ms. Transcripts match Q8.
+
 - 2026-11-18, Whisper Q5_K: pack the GPU codes as low nibbles plus a fifth-bit plane, 160 bytes per
   block, and load eight gemv weights from one word. RX 5700 XT, `jfk`, warm median of 10. Bytes /
   nibbles / bytes: large-v3 796.7 / 774.6 / 795.6 ms. Turbo bytes 556.4, 556.9, 555.3 and nibbles
