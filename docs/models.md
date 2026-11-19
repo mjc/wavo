@@ -53,6 +53,7 @@ Wrong words per 100 on the FLEURS test set, lower is better, the best in bold. T
 | `parakeet-v3` | 0.74GB | 25 European languages | cased, punctuated | 7× |
 | `parakeet-v2` | 0.73GB | English | cased, punctuated | 7.6× |
 | `parakeet-tdt-1.1b` | 1.27GB | English | lowercase, no punctuation | – |
+| `parakeet-unified` | 0.73GB | English | cased, punctuated | – |
 | `parakeet-ultra` (default) | 0.74GB | 25 European languages | cased, punctuated | 7× |
 | `parakeet-he` | 0.74GB | Hebrew | cased, punctuated | 8× |
 | `parakeet-uk` | 0.74GB | Ukrainian and English | cased, punctuated | 6.6× |
@@ -94,7 +95,7 @@ wavo's kernels and algorithms are built from the ideas and code of these project
 
 **Models.** wavo ships no weights: `wavo pull` downloads the GGUF conversions that [handy-computer](https://huggingface.co/handy-computer) publishes on Hugging Face, and [vladkens](https://huggingface.co/vladkens) for the Hebrew models, the Ukrainian Parakeet and GigaAM Multilingual, under the original licenses:
 
-- Parakeet TDT ([v2](https://huggingface.co/nvidia/parakeet-tdt-0.6b-v2), [v3](https://huggingface.co/nvidia/parakeet-tdt-0.6b-v3), [1.1b](https://huggingface.co/nvidia/parakeet-tdt-1.1b)) © NVIDIA, CC-BY-4.0
+- Parakeet TDT ([v2](https://huggingface.co/nvidia/parakeet-tdt-0.6b-v2), [v3](https://huggingface.co/nvidia/parakeet-tdt-0.6b-v3), [1.1b](https://huggingface.co/nvidia/parakeet-tdt-1.1b), [unified](https://huggingface.co/nvidia/parakeet-unified-en-0.6b)) © NVIDIA, CC-BY-4.0
 - [Parakeet Ultra](https://huggingface.co/moondream/parakeet-ultra) © Moondream, CC-BY-4.0
 - [GigaAM v3](https://huggingface.co/ai-sage/GigaAM-v3) © Sber, MIT
 - [GigaAM Multilingual](https://huggingface.co/ai-sage/GigaAM-Multilingual) © Sber, MIT

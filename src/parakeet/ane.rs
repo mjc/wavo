@@ -22,7 +22,7 @@ const T: usize = half(T2);
 
 pub fn build(g: &Gguf, p: &mut Program) -> Result<Vec<Var>> {
   let spec = super::config(g)?;
-  let (cfg, ch, joint, mels) = (spec.cfg, spec.ch, spec.joint, spec.mels);
+  let (cfg, ch, joint, mels, xscale) = (spec.cfg, spec.ch, spec.joint, spec.mels, spec.xscale);
   let mel = p.input("mel", &[1, 1, MEL_FRAMES, mels]);
   let m1 = p.input("m1", &[1, 1, T1, 1]);
   let m2 = p.input("m2", &[1, 1, T2, 1]);
@@ -54,6 +54,7 @@ pub fn build(g: &Gguf, p: &mut Program) -> Result<Vec<Var>> {
   let x = gr.transpose(&x, &[0, 2, 1, 3]);
   let x = gr.reshape(&x, &[T, ch * f]);
   let x = gr.linear(&x, "enc.pre_encode.out", &[ch * f, cfg.d], true)?;
+  let x = if xscale != 1.0 { gr.scale(&x, xscale) } else { x };
   let x = ane::conformer::blocks(&mut gr, &cfg, None, x, &m3, &keys)?;
   gr.p.name_next("enc");
   let out = gr.linear(&x, "joint.enc", &[cfg.d, joint], true)?;

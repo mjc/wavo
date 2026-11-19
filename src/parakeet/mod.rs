@@ -1,9 +1,11 @@
 // Copyright (c) vladkens | MIT License | https://github.com/vladkens/wavo
-//! Parakeet TDT: log-mel frontend on the CPU (128 bins, or 80 for parakeet-tdt-1.1b), FastConformer
-//! encoder (8× conv subsampling, relative positions) on the GPU, the Neural Engine or the CPU, TDT
-//! greedy decoding on the CPU, where the joint also predicts how many frames to advance. Parakeet
-//! Ultra adds kestrel's length masking and symbol budget; its voice activity head, which
-//! transcribe.cpp runs to split audio past 30 s, is not used.
+//! Parakeet TDT and offline RNN-T: log-mel frontend on the CPU (128 bins, or 80 for
+//! parakeet-tdt-1.1b), FastConformer encoder (8× conv subsampling, relative positions) on the GPU,
+//! the Neural Engine or the CPU, greedy decoding on the CPU. TDT's joint also predicts how many
+//! frames to advance; RNN-T emits a token or moves one frame. Parakeet Ultra adds kestrel's length
+//! masking and symbol budget; its voice activity head, which transcribe.cpp runs to split audio
+//! past 30 s, is not used. Streaming is not implemented: `chunked_limited_with_rc` runs as full
+//! attention.
 
 pub mod ane;
 mod cpu;
@@ -52,6 +54,8 @@ struct Spec {
   ch: usize,
   joint: usize,
   mels: usize,
+  /// `sqrt(d_model)` when the file sets `xscaling`, else 1.
+  xscale: f32,
 }
 
 /// Checks the encoder's metadata and returns its config, subsampling channels, joint size and
@@ -59,8 +63,6 @@ struct Spec {
 fn config(g: &Gguf) -> Result<Spec> {
   for (key, want) in [
     ("general.architecture", "parakeet"),
-    ("stt.parakeet.head_kind", "tdt"),
-    ("stt.parakeet.encoder.att_context_style", "regular"),
     ("tokenizer.ggml.model", "bpe"),
     ("stt.frontend.type", "mel"),
     ("stt.frontend.window", "hann"),
@@ -68,6 +70,9 @@ fn config(g: &Gguf) -> Result<Spec> {
   ] {
     g.check(key, &[want])?;
   }
+  g.check("stt.parakeet.head_kind", &["tdt", "rnnt"])?;
+  // Offline full attention. The streaming mask for chunked_limited_with_rc is not built.
+  g.check("stt.parakeet.encoder.att_context_style", &["regular", "chunked_limited_with_rc"])?;
   g.check("stt.frontend.num_mels", &[80u32, MELS as u32])?;
   for (key, want) in [
     ("stt.parakeet.encoder.subsampling_factor", 8),
@@ -83,8 +88,11 @@ fn config(g: &Gguf) -> Result<Spec> {
   }
 
   let bias = g.get::<bool>("stt.parakeet.encoder.use_bias")?;
-  g.check("stt.parakeet.encoder.xscaling", &[false])?;
   let cfg = conformer::Config::load(g, "parakeet", Attention::Relative, bias)?;
+  let xscale = match g.get::<bool>("stt.parakeet.encoder.xscaling")? {
+    true => (cfg.d as f32).sqrt(),
+    false => 1.0,
+  };
   let pad = (cfg.kernel / 2) as i32;
   for (key, want) in [
     ("att_context_left", -1),
@@ -97,13 +105,13 @@ fn config(g: &Gguf) -> Result<Spec> {
   let ch = g.get::<u32>("stt.parakeet.encoder.subsampling_channels")? as usize;
   let joint = g.get::<u32>("stt.parakeet.joint.hidden")? as usize;
   let mels = g.get::<u32>("stt.frontend.num_mels")? as usize;
-  Ok(Spec { cfg, ch, joint, mels })
+  Ok(Spec { cfg, ch, joint, mels, xscale })
 }
 
 impl Parakeet {
   pub fn load(g: &Gguf, target: Target) -> Result<Self> {
     let spec = config(g)?;
-    let mels = spec.mels;
+    let (mels, xscale) = (spec.mels, spec.xscale);
     let kestrel = match g.optional::<&str>("stt.parakeet.encoder.length_masking")? {
       None | Some("none") => false,
       Some("kestrel") => true,
@@ -124,10 +132,10 @@ impl Parakeet {
     // The decoder loads on the CPU while the GPU starts and the encoder uploads.
     let (backend, decoder) = std::thread::scope(|s| {
       let decoder = s.spawn(|| Decoder::new(g, vocab.len(), blank));
-      let gpu = |gpu: &_| Encoder::new(gpu, g, spec.cfg, spec.ch, spec.joint, mels);
+      let gpu = |gpu: &_| Encoder::new(gpu, g, spec.cfg, spec.ch, spec.joint, mels, xscale);
       let cpu = || {
         let spec = config(g)?;
-        cpu::Encoder::new(g, spec.cfg, spec.ch, spec.joint, spec.mels)
+        cpu::Encoder::new(g, spec.cfg, spec.ch, spec.joint, spec.mels, spec.xscale)
       };
       let backend = Backend::new(target, gpu, cpu)?;
       Ok::<_, Error>((backend, decoder.join().unwrap()?))

@@ -446,6 +446,7 @@ struct Portable {
   group_norm: Pipeline,
   swiglu: Pipeline,
   relu: Pipeline,
+  scale: Pipeline,
   argmax: Pipeline,
   mark: Pipeline,
   gemm_module: wgpu::ShaderModule,
@@ -495,6 +496,7 @@ impl Portable {
       group_norm: pipeline(device, &ops, "group_norm", &[]),
       swiglu: pipeline(device, &ops, "swiglu", &[]),
       relu: pipeline(device, &ops, "relu", &[]),
+      scale: pipeline(device, &ops, "scale", &[]),
       argmax: pipeline(device, &ops, "argmax", &[]),
       mark: pipeline(device, &ops, "mark", &[]),
       gemm_module: gemm,
@@ -2325,6 +2327,12 @@ impl<'a> Pass<'a> {
   /// ReLU in place over `x[..n]`.
   pub fn relu(&mut self, x: &Buffer, n: usize) {
     self.run(&self.gpu.kernels.relu, &[x], &[n as u32], [n.div_ceil(256), 1, 1]);
+  }
+
+  /// Multiplies `x[..n]` by `scale`, in place.
+  pub fn scale(&mut self, x: &Buffer, n: usize, scale: f32) {
+    let params = [n as u32, 0, 0, scale.to_bits()];
+    self.run(&self.gpu.kernels.scale, &[x], &params, [n.div_ceil(256), 1, 1]);
   }
 
   /// The index of the largest of `x[..n]` (the lowest on a tie), as the bits of `out[0]`.

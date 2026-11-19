@@ -43,6 +43,7 @@
 //! | `parakeet-v3` | `parakeet-tdt-0.6b-v3` | 0.74 GB | 25 European languages | cased, punctuated |
 //! | `parakeet-v2` | `parakeet-tdt-0.6b-v2` | 0.73 GB | English | cased, punctuated |
 //! | `parakeet-tdt-1.1b` | `parakeet-tdt-1.1b` | 1.27 GB | English | lowercase, no punctuation |
+//! | `parakeet-unified` | `parakeet-unified-en-0.6b` | 0.73 GB | English | cased, punctuated |
 //! | `parakeet-ultra` | `parakeet-ultra` | 0.74 GB | 25 European languages | cased, punctuated |
 //! | `parakeet-he` | `parakeet-tdt-0.6b-v3-he` | 0.74 GB | Hebrew | cased, punctuated |
 //! | `parakeet-uk` | `parakeet-tdt-0.6b-v3-uk` | 0.74 GB | Ukrainian and English | cased, punctuated |
