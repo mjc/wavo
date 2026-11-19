@@ -200,6 +200,15 @@ two numbers (A/B/A, warm median unless stated), kept or rejected and why.
 
 ### GEMM
 
+- 2026-11-18, Parakeet Ultra and GigaAM v3 RNN-T, portable GEMM on an RX 5700 XT (RADV NAVI10).
+  Every weight type stages the rounded K tile as f16 pairs, and Q4_K computes 64 columns per
+  workgroup instead of 128. `wavo bench -n 10`, warm medians, previous / this / previous: Q4
+  Ultra `jfk` 103.3 / 96.4 / 103.7, `dots` 246.6 / 249.9 / 252.8; GigaAM Q4 `ru-short` 52.8 /
+  50.2 / 52.9, `ru-long` 131.6 / 124.6 / 132.1. Q8 Ultra `jfk` 113.4 / 108.9 / 112.4, GigaAM Q8
+  `ru-long` 140.8 / 128.3 / 142.7 ms. The two previous runs agreed. Ultra `dots` stayed inside
+  that spread. Parakeet and GigaAM `jfk`, `dots`, `ru`, `ru-short`, `ru-long` match the previous
+  Q4 text. Kept. The cooperative-matrix GEMM is unchanged.
+
 - 2026-11-18, Parakeet Ultra and GigaAM v3 RNN-T Q4_K_M, portable GEMM on an RX 5700 XT (RADV
   NAVI10). The upload stores each group's `d·scale` and `dmin·min` as f32, and the K tile keeps
   the rounded weights as f16 pairs instead of f32. `wavo bench -n 10`, warm medians, Q8 / Q4 /

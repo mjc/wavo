@@ -336,7 +336,14 @@ impl Portable {
         .map(|ty| match cpu {
           true => pipeline(device, &gemm, "gemm64", &[("WTYPE", ty as f64)]),
           false => {
-            let constants = [("WTYPE", ty as f64), ("ROWS", gemm_tile[1] as f64)];
+            // Q4_K stages half as many columns. One f16 quad per k-step is `cols * 8` entries.
+            let cols = if ty == 7 { 64 } else { gemm_tile[0] };
+            let constants = [
+              ("WTYPE", ty as f64),
+              ("ROWS", gemm_tile[1] as f64),
+              ("COLS", cols as f64),
+              ("WT", (cols * 8) as f64),
+            ];
             pipeline(device, &gemm, "gemm", &constants)
           }
         })
@@ -1644,7 +1651,9 @@ impl<'a> Pass<'a> {
         )
       }
       _ => {
-        let [cols, rows] = gpu.kernels.gemm_tile;
+        let [tile, rows] = gpu.kernels.gemm_tile;
+        // The Q4_K pipeline is compiled at 64 columns. A 64-wide CPU tile is already that shader.
+        let cols = if l.ty == 7 && tile == 128 { 64 } else { tile };
         let size = [l.n.div_ceil(cols), m.div_ceil(rows), 1];
         self.run(&gpu.kernels.gemm[l.ty], &buffers, &params, size)
       }
