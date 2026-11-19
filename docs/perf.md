@@ -198,6 +198,14 @@ two numbers (A/B/A, warm median unless stated), kept or rejected and why.
 
 ### GEMM
 
+- 2026-11-19, Whisper Q5_K, Apple M1: cache `q4k_dm` in a private scale/minimum pair keyed
+  by the absolute group of 32 in `gemm_fast.wgsl`. At ROWS=64 each thread reuses it over four
+  K steps. `jfk`, warm median of 10, bytes / cache / bytes: turbo 1992.1 / 2016.7 / 1996.7 ms
+  (mins 1983.4 / 2005.8 / 1986.1), large-v3 2909.6 / 2916.5 / 2902.1 ms
+  (mins 2882.9 / 2903.2 / 2891.3). Baseline drift 0.23% and 0.26%. Rejected: turbo is slower
+  and large-v3 has no clear gain. Both transcripts match. The byte layout and Q4_K scale math
+  stay as before.
+
 - 2026-11-19, Whisper Q5_K: store the GPU codes as bytes 0..31, 256 per block, and load a quad with
   `unpack4xI8`. On the Apple M1 nibble binary, turbo Q5 / Q4 / Q5 was 2136.6 / 2080.4 / 2132.3 ms.
   `jfk`, warm median of 10. Apple M1, nibbles / bytes / nibbles: turbo 2131.5 / 1988.1 / 2136.6 ms,
