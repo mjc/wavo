@@ -200,6 +200,42 @@ two numbers (A/B/A, warm median unless stated), kept or rejected and why.
 
 ### GEMM
 
+- 2026-11-19, Whisper Q5_K, Apple M1: cache `q4k_dm` in a private scale/minimum pair keyed
+  by the absolute group of 32 in `gemm_fast.wgsl`. At ROWS=64 each thread reuses it over four
+  K steps. `jfk`, warm median of 10, bytes / cache / bytes: turbo 1992.1 / 2016.7 / 1996.7 ms
+  (mins 1983.4 / 2005.8 / 1986.1), large-v3 2909.6 / 2916.5 / 2902.1 ms
+  (mins 2882.9 / 2903.2 / 2891.3). Baseline drift 0.23% and 0.26%. Rejected: turbo is slower
+  and large-v3 has no clear gain. Both transcripts match. The byte layout and Q4_K scale math
+  stay as before.
+
+- 2026-11-19, Whisper Q5_K: store the GPU codes as bytes 0..31, 256 per block, and load a quad with
+  `unpack4xI8`. On the Apple M1 nibble binary, turbo Q5 / Q4 / Q5 was 2136.6 / 2080.4 / 2132.3 ms.
+  `jfk`, warm median of 10. Apple M1, nibbles / bytes / nibbles: turbo 2131.5 / 1988.1 / 2136.6 ms,
+  large-v3 2983.6 / 2903.0 / 2981.4 ms. RX 5700 XT, nibbles / bytes / nibbles: large-v3
+  815.6 / 813.8 / 812.8 ms, turbo 587.2 / 579.8 / 576.7 ms. Transcripts match Q8. The two layouts
+  tie on the 5700 XT. Kept.
+
+- 2026-11-18, Apple M1, Metal 8×8 kernels, the Q5_K nibble plane unchanged. `jfk`, warm median of 10.
+  Q8 / Q5 / Q8: turbo 1934.1 / 2143.4 / 1945.3 ms, large-v3 2833.2 / 2986.3 / 2838.2 ms.
+  `WAVO_KERNELS=matrix8` on turbo Q5 was 2133.5 ms. Transcripts match Q8.
+
+- 2026-11-18, Whisper Q5_K: pack the GPU codes as low nibbles plus a fifth-bit plane, 160 bytes per
+  block, and load eight gemv weights from one word. RX 5700 XT, `jfk`, warm median of 10. Bytes /
+  nibbles / bytes: large-v3 796.7 / 774.6 / 795.6 ms. Turbo bytes 556.4, 556.9, 555.3 and nibbles
+  558.5, 558.3. Both jfk transcripts match Q8. Kept.
+
+- 2026-11-18, Whisper large-v3 Q5_K: timestamp each dispatch in its own pass on `jfk` (RX 5700 XT,
+  one warm call; the sums run a little high). One call's gemv is Q8 93.8 ms, Q4_K 103.6, Q5_K 119.2.
+  Attention and the other kernels match, about 194 ms. Encoder GEMMs are Q8 454 ms, Q4_K 460, Q5_K
+  463. The wall gap is that gemv. The 5-bit pack already cost more than these extra code bytes.
+  No shader change.
+
+- 2026-11-18, Whisper Q5_K: upload the codes as bytes 0..31, 256 per block, instead of the
+  Q5_0 5-bit pack. The gemv spent the difference on that extract. RX 5700 XT, `jfk`, warm
+  median. 5-bit pack, Q8 / Q5 / Q4 / Q8: turbo 554.9 / 576.9 / 552.9 / 545.3, large-v3
+  768.0 / 859.2 / 781.1 / 761.4. Bytes, Q8 / Q5 / Q8: turbo 545.3 / 556.6 / 545.8, large-v3
+  762.2 / 795.7 / 762.2. Both Q5 transcripts match Q8. Kept.
+
 - 2026-11-18, Parakeet Ultra and GigaAM v3 RNN-T, portable GEMM on an RX 5700 XT (RADV NAVI10).
   Every weight type stages the rounded K tile as f16 pairs, and Q4_K computes 64 columns per
   workgroup instead of 128. `wavo bench -n 10`, warm medians, previous / this / previous: Q4

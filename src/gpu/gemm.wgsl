@@ -10,7 +10,7 @@
 // of `a` (not rounded, as `mul_mv`), and `embed`.
 
 // Weight type, one pipeline each: 0: F32, 1: F16, 2: Q8_0, 3: Q5_0, 4: Q4_0, 5: Q4_1, 6: Q5_1,
-// 7: Q4_K.
+// 7: Q4_K, 8: Q6_K, 9: Q5_K.
 override WTYPE: u32;
 // Rows of the GEMM's tile: 64, or 32 (more workgroups).
 override ROWS: u32 = 64u;
@@ -43,11 +43,14 @@ var<immediate> p: Params;
 @group(0) @binding(1) var<storage, read> bias: array<f32>;
 @group(0) @binding(2) var<storage, read_write> c: array<f32>;
 // F32 as bits, F16 as pairs, Q8_0 as 4 int8 per word, Q4 as nibbles (16 bytes per 32), Q5 as
-// 5-bit codes (24 bytes per 32), Q4_K as nibbles (128 bytes per 256).
+// 5-bit codes (24 bytes per 32), Q4_K as nibbles (128 bytes per 256), Q6_K as i8 codes already
+// minus 32 (256 bytes per 256), Q5_K as bytes 0..31 (256 bytes per 256).
 @group(0) @binding(3) var<storage, read> w: array<u32>;
 // Q8_0, Q5_0 and Q4_0: one f16 scale per block, two per word. Q4_1 and Q5_1: an f16 scale and an
 // f16 minimum, one pair per word. Q4_K: eight f32 pairs per 256 weights, `d·scale` and `dmin·min`
-// for each group of 32, formed at upload. Any buffer for the other types.
+// for each group of 32, formed at upload. Q6_K: 20 bytes per 256 (f16 scale, sixteen i8 scales,
+// two pad bytes). Q5_K uses a 20-byte record: f16 scale, f16 minimum, eight scales, eight
+// minimums. Any buffer for the other types.
 @group(0) @binding(4) var<storage, read> scales: array<u32>;
 // `a` for the GEMM's 16-byte loads.
 @group(0) @binding(0) var<storage, read> a4: array<vec4<f32>>;
@@ -215,6 +218,44 @@ fn q4k_4(x: u32) -> vec4<f32> {
   return q4k_codes4(x) * s.x - s.y;
 }
 
+// Four Q6_K weights at x (a multiple of 4). Codes are i8 in weight order, already −32. Sixteen
+// weights share one i8 scale, so the four codes share it. The scale record is f16 d, then the
+// scales, then two pad bytes.
+fn q6k_4(x: u32) -> vec4<f32> {
+  let block = x / 256u;
+  let local = x % 256u;
+  let codes = vec4<f32>(unpack4xI8(w[block * 64u + local / 4u]));
+  let base = block * 5u;
+  let byte = 2u + local / 16u;
+  let shift = (byte % 4u) * 8u;
+  let raw = (scales[base + byte / 4u] >> shift) & 255u;
+  let sc = select(f32(raw), f32(raw) - 256.0, raw >= 128u);
+  let d = unpack2x16float(scales[base]).x;
+  return codes * (d * sc);
+}
+
+// `d · scale` and `dmin · min` for the Q5_K group of 32 that contains x. The record is 20 bytes:
+// f16 scale, f16 minimum, eight scales, eight minimums.
+fn q5k_dm(x: u32) -> vec2<f32> {
+  let block = x / 256u;
+  let sub = (x % 256u) / 32u;
+  let base = block * 5u;
+  let hd = unpack2x16float(scales[base]);
+  let shift = (sub % 4u) * 8u;
+  let scale = (scales[base + 1u + sub / 4u] >> shift) & 255u;
+  let min = (scales[base + 3u + sub / 4u] >> shift) & 255u;
+  return vec2(hd.x * f32(scale), hd.y * f32(min));
+}
+
+// Four Q5_K codes at x (a multiple of 4). Bytes 0..31 in weight order, 256 per block.
+fn q5k_4(x: u32) -> vec4<f32> {
+  let block = x / 256u;
+  let local = x % 256u;
+  let codes = vec4<f32>(unpack4xI8(w[block * 64u + local / 4u]));
+  let s = q5k_dm(x);
+  return codes * s.x - s.y;
+}
+
 fn lane(v: vec4<f32>, x: u32) -> f32 {
   switch x & 3u {
     case 0u: { return v.x; }
@@ -287,6 +328,8 @@ fn w_words(n: u32, k: u32) -> vec4<u32> {
     case 5u: { return bitcast<vec4<u32>>(q41_at(n, k)); }
     case 6u: { return bitcast<vec4<u32>>(q51_at(n, k)); }
     case 7u: { return bitcast<vec4<u32>>(q4k_4(x)); }
+    case 8u: { return bitcast<vec4<u32>>(q6k_4(x)); }
+    case 9u: { return bitcast<vec4<u32>>(q5k_4(x)); }
     default: { return vec4(w[x / 4u], scales[x / 64u], (x / 32u) & 1u, 0u); }
   }
 }
@@ -297,7 +340,7 @@ fn w_floats(v: vec4<u32>) -> vec4<f32> {
   switch WTYPE {
     case 0u: { x = bitcast<vec4<f32>>(v); }
     case 1u: { x = vec4(unpack2x16float(v.x), unpack2x16float(v.y)); }
-    case 3u, 4u, 5u, 6u, 7u: { x = bitcast<vec4<f32>>(v); }
+    case 3u, 4u, 5u, 6u, 7u, 8u, 9u: { x = bitcast<vec4<f32>>(v); }
     default: {
       let s = unpack2x16float(v.y);
       x = vec4<f32>(unpack4xI8(v.x)) * select(s.x, s.y, v.z == 1u);
@@ -456,6 +499,17 @@ fn dot8(row: u32, j: u32, a0: vec4<f32>, a1: vec4<f32>) -> f32 {
     case 5u: { return dot(q41_at(row, 8u * j), a0) + dot(q41_at(row, 8u * j + 4u), a1); }
     case 6u: { return dot(q51_at(row, 8u * j), a0) + dot(q51_at(row, 8u * j + 4u), a1); }
     case 7u: { return dot(q4k_4(x), a0) + dot(q4k_4(x + 4u), a1); }
+    case 8u: { return dot(q6k_4(x), a0) + dot(q6k_4(x + 4u), a1); }
+    case 9u: {
+      // x is a multiple of 8, so two words hold the eight codes and one group of 32 holds the scale.
+      let block = x / 256u;
+      let local = x % 256u;
+      let c0 = vec4<f32>(unpack4xI8(w[block * 64u + local / 4u]));
+      let c1 = vec4<f32>(unpack4xI8(w[block * 64u + local / 4u + 1u]));
+      let s = q5k_dm(x);
+      return dot(c0, a0) * s.x - (a0.x + a0.y + a0.z + a0.w) * s.y
+        + dot(c1, a1) * s.x - (a1.x + a1.y + a1.z + a1.w) * s.y;
+    }
     default: {
       let q = x / 4u;
       let d = dot(vec4<f32>(unpack4xI8(w[q])), a0) + dot(vec4<f32>(unpack4xI8(w[q + 1u])), a1);
@@ -530,6 +584,8 @@ fn embed(@builtin(global_invocation_id) id: vec3<u32>) {
       case 5u: { v = q41_one(x); }
       case 6u: { v = q51_one(x); }
       case 7u: { v = lane(q4k_4(x & ~3u), x); }
+      case 8u: { v = lane(q6k_4(x & ~3u), x); }
+      case 9u: { v = lane(q5k_4(x & ~3u), x); }
       default: { v = f32(unpack4xI8(w[x / 4u])[x % 4u]) * scale(x / 32u); }
     }
   }
