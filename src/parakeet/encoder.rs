@@ -1,14 +1,13 @@
 // Copyright (c) vladkens | MIT License | https://github.com/vladkens/wavo
 //! Encoder on the GPU: 8× subsampling of the mel image `[t][freq]` by 3×3 stride-2 convs (conv0 +
 //! ReLU, depthwise conv2, pointwise conv3 + ReLU, depthwise conv5, pointwise conv6 + ReLU),
-//! flattened to `[t][channel · 16 + freq]` and projected to d_model, then the Conformer blocks with
+//! flattened to `[t][channel · freq]` and projected to d_model, then the Conformer blocks with
 //! relative positions, then the joint's encoder projection. All dispatches of a call go into one
 //! compute pass over a preallocated arena.
 
 use std::sync::{Mutex, PoisonError};
 
 use super::encoder_frames;
-use super::frontend::MELS;
 use crate::conformer::{self, Buffers, Conformer};
 use crate::error::Result;
 use crate::gguf::Gguf;
@@ -21,6 +20,7 @@ const CHUNKS: usize = 8;
 pub struct Encoder {
   /// Subsampling channels.
   ch: usize,
+  mels: usize,
   conv0: Channels,
   conv2: Channels,
   conv3: Linear,
@@ -48,7 +48,14 @@ struct Arena {
 }
 
 impl Encoder {
-  pub fn new(gpu: &Gpu, g: &Gguf, cfg: conformer::Config, ch: usize, joint: usize) -> Result<Self> {
+  pub fn new(
+    gpu: &Gpu,
+    g: &Gguf,
+    cfg: conformer::Config,
+    ch: usize,
+    joint: usize,
+    mels: usize,
+  ) -> Result<Self> {
     let d = cfg.d;
     let f32s = |name: String, dims: &[usize]| g.tensor(&name, dims)?.to_f32();
     // Weights from [ch][time tap][frequency tap] to [tap][ch].
@@ -61,25 +68,26 @@ impl Encoder {
     let linear = |name: &str, dims: &[usize]| conformer::linear(gpu, g, &[name.into()], dims, true);
     Ok(Self {
       ch,
+      mels,
       conv0: conv(0)?,
       conv2: conv(2)?,
       conv3: linear("enc.pre_encode.conv.3", &[1, 1, ch, ch])?,
       conv5: conv(5)?,
       conv6: linear("enc.pre_encode.conv.6", &[1, 1, ch, ch])?,
-      out: linear("enc.pre_encode.out", &[ch * half(half(half(MELS))), d])?,
+      out: linear("enc.pre_encode.out", &[ch * half(half(half(mels))), d])?,
       conformer: Conformer::load(gpu, g, cfg)?,
       joint: linear("joint.enc", &[d, joint])?,
       arena: Mutex::new(None),
     })
   }
 
-  /// Encodes `mel` `[mel frames][MELS]` and returns the joint's encoder projections, one row per
+  /// Encodes `mel` `[mel frames][mels]` and returns the joint's encoder projections, one row per
   /// encoder frame (`encoder_frames`), in rows of the returned width (the joint's size padded to a
   /// multiple of 64). With `valid` less than the mel frames, the frames past it are padding, as
   /// transcribe.cpp's kestrel length masking has it: the subsampling masks its outputs past their
   /// valid lengths.
   pub fn run(&self, gpu: &Gpu, mel: &[f32], valid: usize) -> Result<(Vec<f32>, usize)> {
-    let mel_frames = mel.len() / MELS;
+    let mel_frames = mel.len() / self.mels;
     let (t, d, width) = (encoder_frames(mel_frames), self.conformer.cfg.d, self.joint.width());
     // Sized for all mel frames: the buffers hold 8 of them per encoder frame.
     let all = half(half(half(mel_frames)));
@@ -101,18 +109,18 @@ impl Encoder {
 
   /// `frames` are the mel frames and the valid ones of them.
   fn record(&self, p: &mut Pass, b: &Buffers, mel: &Buffer, out: &Buffer, frames: [usize; 2]) {
-    let (ch, [mel_frames, valid]) = (self.ch, frames);
+    let (ch, mels, [mel_frames, valid]) = (self.ch, self.mels, frames);
     // The first conv's output past its valid rows is zero, as is the second's: the fused kernel
     // sees the valid mel frames only (the frame past them is zero) and zeroes conv2's rows past
     // its own. conv5 sees conv3's output of those rows, then zero padding.
-    let (t2, f2) = (half(half(mel_frames)), half(half(MELS)));
+    let (t2, f2) = (half(half(mel_frames)), half(half(mels)));
     let (t, f) = (encoder_frames(mel_frames), half(f2));
     // Always CHUNKS chunks, some maybe empty, so the dispatches match the cached bind groups.
     let c = t.div_ceil(CHUNKS);
     for t0 in (0..CHUNKS).map(|i| i * c) {
       let n = c.min(t.saturating_sub(t0));
       let rows = if n == 0 { 0 } else { 2 * n + 1 };
-      p.depthwise(mel, Some(&self.conv0), &self.conv2, &b.yr, [valid, MELS, ch], t0, rows);
+      p.depthwise(mel, Some(&self.conv0), &self.conv2, &b.yr, [valid, mels, ch], t0, rows);
       p.gemm(&b.yr, &self.conv3, &b.qk, rows * f2, Epilogue::Relu);
       p.depthwise(&b.qk, None, &self.conv5, &b.h, [t2, f2, ch], t0, n);
     }
@@ -128,9 +136,9 @@ impl Encoder {
     let (d, n) = (c.d, pos_rows(frames));
     let table = conformer::rel_positions(d, frames as i64 + 15, n);
     // A subsampling chunk of the first two outputs: 2·frames / CHUNKS + 1 rows of
-    // [MELS / 4][ch]; the third output [frames][MELS / 8][ch].
-    let chunk = (2 * frames / CHUNKS + 1) * half(half(MELS)) * self.ch;
-    let third = frames * half(half(half(MELS))) * self.ch;
+    // [mels / 4][ch]; the third output [frames][mels / 8][ch].
+    let chunk = (2 * frames / CHUNKS + 1) * half(half(self.mels)) * self.ch;
+    let third = frames * half(half(half(self.mels))) * self.ch;
     let width = self.joint.width();
     let bufs = Buffers {
       x: gpu.buffer(frames * d),
@@ -145,7 +153,7 @@ impl Encoder {
       frames,
       bufs,
       table,
-      mel: gpu.buffer(8 * frames * MELS),
+      mel: gpu.buffer(8 * frames * self.mels),
       out: gpu.buffer(frames * width),
       read: gpu.readback(frames * width),
       groups: Vec::new(),

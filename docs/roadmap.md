@@ -46,6 +46,7 @@ at a time: port it, match the reference exactly, make it fast, move on. Tick a p
       and `wavo run --diarize` on the GPU or the CPU, 1.5× parakeet.cpp's speed on Metal on an M5
       (#100); OpenAI's `diarized_json` in `wavo serve`.
       [Plan](plans/completed/20261110-diarization.md)
+- [x] **Parakeet TDT 1.1b:** 80 mel bins and encoder biases. English, lowercase, no punctuation.
 - [x] **Docker image** `ghcr.io/vladkens/wavo`, x86_64 and arm64, pushed on main and on release:
       Intel and AMD GPUs through `/dev/dri` on x86_64, else the CPU; on an N100 as fast as outside
       it (#116).

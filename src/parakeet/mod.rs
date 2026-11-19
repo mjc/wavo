@@ -1,9 +1,9 @@
 // Copyright (c) vladkens | MIT License | https://github.com/vladkens/wavo
-//! Parakeet TDT: log-mel frontend on the CPU, FastConformer encoder (8× conv subsampling, relative
-//! positions) on the GPU, the Neural Engine or the CPU, TDT greedy decoding on the CPU, where the
-//! joint also predicts how many frames to advance. Parakeet Ultra adds kestrel's length masking and
-//! symbol budget; its voice activity head, which transcribe.cpp runs to split audio past 30 s, is
-//! not used.
+//! Parakeet TDT: log-mel frontend on the CPU (128 bins, or 80 for parakeet-tdt-1.1b), FastConformer
+//! encoder (8× conv subsampling, relative positions) on the GPU, the Neural Engine or the CPU, TDT
+//! greedy decoding on the CPU, where the joint also predicts how many frames to advance. Parakeet
+//! Ultra adds kestrel's length masking and symbol budget; its voice activity head, which
+//! transcribe.cpp runs to split audio past 30 s, is not used.
 
 pub mod ane;
 mod cpu;
@@ -45,8 +45,18 @@ fn encoder_frames(mel_frames: usize) -> usize {
   half(half(half(mel_frames - 1)))
 }
 
-/// Checks the encoder's metadata and returns its config, subsampling channels and joint size.
-fn config(g: &Gguf) -> Result<(conformer::Config, usize, usize)> {
+/// What [`config`] reads off a Parakeet GGUF.
+struct Spec {
+  cfg: conformer::Config,
+  /// Subsampling channels.
+  ch: usize,
+  joint: usize,
+  mels: usize,
+}
+
+/// Checks the encoder's metadata and returns its config, subsampling channels, joint size and
+/// mel bins.
+fn config(g: &Gguf) -> Result<Spec> {
   for (key, want) in [
     ("general.architecture", "parakeet"),
     ("stt.parakeet.head_kind", "tdt"),
@@ -58,10 +68,10 @@ fn config(g: &Gguf) -> Result<(conformer::Config, usize, usize)> {
   ] {
     g.check(key, &[want])?;
   }
+  g.check("stt.frontend.num_mels", &[80u32, MELS as u32])?;
   for (key, want) in [
     ("stt.parakeet.encoder.subsampling_factor", 8),
     ("stt.frontend.sample_rate", 16000),
-    ("stt.frontend.num_mels", MELS),
     ("stt.frontend.n_fft", N_FFT),
     ("stt.frontend.win_length", WINDOW),
     ("stt.frontend.hop_length", HOP),
@@ -72,9 +82,9 @@ fn config(g: &Gguf) -> Result<(conformer::Config, usize, usize)> {
     g.check(&format!("stt.frontend.{key}"), &[want])?;
   }
 
-  g.check("stt.parakeet.encoder.use_bias", &[false])?;
+  let bias = g.get::<bool>("stt.parakeet.encoder.use_bias")?;
   g.check("stt.parakeet.encoder.xscaling", &[false])?;
-  let cfg = conformer::Config::load(g, "parakeet", Attention::Relative, false)?;
+  let cfg = conformer::Config::load(g, "parakeet", Attention::Relative, bias)?;
   let pad = (cfg.kernel / 2) as i32;
   for (key, want) in [
     ("att_context_left", -1),
@@ -86,12 +96,14 @@ fn config(g: &Gguf) -> Result<(conformer::Config, usize, usize)> {
   }
   let ch = g.get::<u32>("stt.parakeet.encoder.subsampling_channels")? as usize;
   let joint = g.get::<u32>("stt.parakeet.joint.hidden")? as usize;
-  Ok((cfg, ch, joint))
+  let mels = g.get::<u32>("stt.frontend.num_mels")? as usize;
+  Ok(Spec { cfg, ch, joint, mels })
 }
 
 impl Parakeet {
   pub fn load(g: &Gguf, target: Target) -> Result<Self> {
-    let (cfg, ch, joint) = config(g)?;
+    let spec = config(g)?;
+    let mels = spec.mels;
     let kestrel = match g.optional::<&str>("stt.parakeet.encoder.length_masking")? {
       None | Some("none") => false,
       Some("kestrel") => true,
@@ -112,13 +124,16 @@ impl Parakeet {
     // The decoder loads on the CPU while the GPU starts and the encoder uploads.
     let (backend, decoder) = std::thread::scope(|s| {
       let decoder = s.spawn(|| Decoder::new(g, vocab.len(), blank));
-      let gpu = |gpu: &_| Encoder::new(gpu, g, cfg, ch, joint);
-      let cpu = || cpu::Encoder::new(g, config(g)?.0, ch, joint);
+      let gpu = |gpu: &_| Encoder::new(gpu, g, spec.cfg, spec.ch, spec.joint, mels);
+      let cpu = || {
+        let spec = config(g)?;
+        cpu::Encoder::new(g, spec.cfg, spec.ch, spec.joint, spec.mels)
+      };
       let backend = Backend::new(target, gpu, cpu)?;
       Ok::<_, Error>((backend, decoder.join().unwrap()?))
     })?;
     let tok = Tokenizer::new(&vocab);
-    Ok(Self { backend, frontend: Frontend::new(), decoder, tok, special, kestrel })
+    Ok(Self { backend, frontend: Frontend::new(mels), decoder, tok, special, kestrel })
   }
 
   pub fn device(&self) -> &crate::Device {
@@ -131,10 +146,11 @@ impl Parakeet {
       return Ok(Transcript::default());
     }
     // kestrel also masks the subsampling at its valid length, pcm.len() / HOP: all but the last.
-    let valid = mel.len() / MELS - self.kestrel as usize;
+    let mels = self.frontend.mels;
+    let valid = mel.len() / mels - self.kestrel as usize;
     let (enc, width) = match &self.backend {
       Backend::Gpu(gpu) => gpu.1.run(&gpu.0, &mel, valid)?,
-      Backend::Ane(model) => ane::run(model, &mel, valid)?,
+      Backend::Ane(model) => ane::run(model, &mel, valid, mels)?,
       Backend::Cpu(encoder) => encoder.run(&mel, valid),
     };
     let (ids, frames): (Vec<usize>, Vec<u32>) = (self.decoder.decode(&enc, width).into_iter())
