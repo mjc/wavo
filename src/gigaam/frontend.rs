@@ -3,7 +3,7 @@
 //! full frames only (`center=False`), power spectrum, `ln(clamp(mel, 1e-9, 1e9))`.
 
 use crate::cpu::ops;
-use crate::error::Result;
+use crate::error::{Result, bail};
 use crate::fft::Rfft8;
 use crate::gguf::Gguf;
 
@@ -25,6 +25,9 @@ pub struct Frontend {
 
 impl Frontend {
   pub fn new(g: &Gguf, mels: usize) -> Result<Self> {
+    if mels == 0 {
+      bail!("gigaam frontend mel count must be nonzero");
+    }
     let filters = g.tensor("frontend.mel_filterbank", &[BINS, mels])?.to_f32()?;
     let mut weights = Vec::new();
     let mut spans = Vec::with_capacity(mels);

@@ -642,19 +642,18 @@ fn softmax(scores: &mut [f32], m: usize, t: usize, scale: f32) {
         max = v;
       }
     }
-    max *= scale;
     let (chunks, tail) = row.as_chunks_mut::<16>();
     let mut sum16 = [0.0f32; 16];
     for c in chunks {
       for (s, x) in sum16.iter_mut().zip(c.iter_mut()) {
-        let e = exp(fma(*x, scale, -max));
+        let e = exp((*x - max) * scale);
         *x = e;
         *s += e;
       }
     }
     let mut total = reduce16(sum16);
     for x in tail {
-      let e = exp(fma(*x, scale, -max));
+      let e = exp((*x - max) * scale);
       *x = e;
       total += e;
     }

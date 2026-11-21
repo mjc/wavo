@@ -280,7 +280,7 @@ pub fn gemm(a: &[f32], l: &Linear, c: &mut [f32], m: usize, epilogue: Epilogue) 
       epilogue,
       kq + 4 * kd,
       |panels| (vec![0i8; panels * kq], vec![0.0; panels * kd]),
-      |(q, d), i, p| neon::pack(q8, l.n, p, &mut q[i * kq..][..kq], &mut d[i * kd..][..kd]),
+      |(q, d), i, p| neon::pack(q8, l.n, k, p, &mut q[i * kq..][..kq], &mut d[i * kd..][..kd]),
       |(q, d), i, row, last| {
         let at = |r: usize| (row + r).min(last - 1);
         let ahi = std::array::from_fn(|r| &ahi[at(r) * k..][..k]);
@@ -857,10 +857,9 @@ mod neon {
     }
   }
 
-  /// Panel `p` of `w` (`n` rows) for `tile_i16`: values `[k / 4][NR][4]` (four of `k` per lane)
-  /// and scales `[k / 32][NR]`, zeros past the last row.
-  pub fn pack(w: &Q8, n: usize, p: usize, q: &mut [i8], d: &mut [f32]) {
-    let k = w.k;
+  /// Panel `p` of `w` (`n` rows of logical width `k`) for `tile_i16`: values `[k / 4][NR][4]`
+  /// (four of `k` per lane) and scales `[k / 32][NR]`, zeros past the last row.
+  pub fn pack(w: &Q8, n: usize, k: usize, p: usize, q: &mut [i8], d: &mut [f32]) {
     let blocks = k / 32;
     let base = NR * p;
     if base + NR <= n {

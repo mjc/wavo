@@ -42,7 +42,7 @@ pub struct Rfft8 {
   /// Radix of stage 0 (fused with the windowed gather).
   stage0: u8,
   /// `2 * perm[i]` for `i in 0..n/2`: the even sample index of digit-reversed pair `i`.
-  perm2: Vec<u16>,
+  perm2: Vec<u32>,
   /// In-place mixed-radix stages after stage 0.
   stages: Vec<Stage>,
   /// `(cos(2πk/n), sin(2πk/n))` for `k = 1..n/4`, used to unpack the real spectrum.
@@ -69,14 +69,14 @@ impl Rfft8 {
     }
     assert_eq!(rem, 1, "Rfft8 length {n} has unsupported odd factor {rem}");
 
-    let mut perm2 = vec![0u16; m];
+    let mut perm2 = vec![0u32; m];
     for (i, slot) in perm2.iter_mut().enumerate() {
       let (mut x, mut p) = (i, 0usize);
       for &r in &radices {
         p = p * r + x % r;
         x /= r;
       }
-      *slot = (2 * p) as u16;
+      *slot = (2 * p) as u32;
     }
 
     let trig = |num: usize, den: usize| -> (f32, f32) {
@@ -128,7 +128,7 @@ impl Rfft8 {
       stride = group;
     }
 
-    let unpack = (1..m / 2)
+    let unpack = (1..=(m - 1) / 2)
       .map(|k| {
         let (c, s) = trig(k, n);
         [c, s]
@@ -206,14 +206,14 @@ impl Rfft8 {
       P::store8(pm, &mut power[half]);
     }
 
-    let (p_lo, p_hi) = power[1..m].split_at_mut(half);
-    let p_lo = &mut p_lo[..half - 1];
-    let hi_start = p_hi.len() - (half - 1);
+    let pairs = (m - 1) / 2;
+    let (p_lo, p_hi) = power[1..m].split_at_mut(pairs);
+    let hi_start = p_hi.len() - pairs;
     let p_hi = &mut p_hi[hi_start..];
-    let re_lo = &re[1..half];
-    let re_hi = &re[m - (half - 1)..m];
-    let im_lo = &im[1..half];
-    let im_hi = &im[m - (half - 1)..m];
+    let re_lo = &re[1..1 + pairs];
+    let re_hi = &re[m - pairs..m];
+    let im_lo = &im[1..1 + pairs];
+    let im_hi = &im[m - pairs..m];
     for ((((&ar, &ai), (&br, &bi)), (pk, pmk)), &[c, s]) in re_lo
       .iter()
       .zip(im_lo)
@@ -258,7 +258,7 @@ fn gather_pair8(fs: [&[f32]; 8], p: usize) -> ([f32; 8], [f32; 8]) {
 fn gather_windowed_f32(
   fs: [&[f32]; 8],
   w: &[f32],
-  perm2: &[u16],
+  perm2: &[u32],
   re: &mut [[f32; 8]],
   im: &mut [[f32; 8]],
 ) {
@@ -395,7 +395,7 @@ fn stage0_r4(re: &mut [[f32; 8]], im: &mut [[f32; 8]]) {
 fn load_stage_r5(
   fs: [&[f32]; 8],
   w: &[f32],
-  perm2: &[u16],
+  perm2: &[u32],
   re: &mut [[f32; 8]],
   im: &mut [[f32; 8]],
 ) {
@@ -607,7 +607,7 @@ fn stage_r5(re: &mut [[f32; 8]], im: &mut [[f32; 8]], stride: usize, tw: &[[f32;
 /// 8-lane `[f64; 8]` loops over non-aliasing locals autovectorize cleanly to NEON `float64x2_t`.
 pub struct Rfft8F64 {
   n: usize,
-  perm2: Vec<u16>,
+  perm2: Vec<u32>,
   /// Radix-4 twiddles for stages `stride = 4, 16, 64, ...`.
   stages: Vec<(usize, Vec<[f64; 6]>)>,
   unpack: Vec<[f64; 2]>,
@@ -615,6 +615,7 @@ pub struct Rfft8F64 {
 
 impl Rfft8F64 {
   pub fn new(n: usize) -> Self {
+    assert!(n >= 8 && n.is_multiple_of(2), "Rfft8F64 needs n = 2 * 4^k, got {n}");
     let m = n / 2;
     let mut rem = m;
     let mut count = 0usize;
@@ -622,15 +623,15 @@ impl Rfft8F64 {
       count += 1;
       rem /= 4;
     }
-    assert!(n >= 8 && n.is_multiple_of(2) && rem == 1, "Rfft8F64 needs n = 2 * 4^k, got {n}");
-    let mut perm2 = vec![0u16; m];
+    assert_eq!(rem, 1, "Rfft8F64 needs n = 2 * 4^k, got {n}");
+    let mut perm2 = vec![0u32; m];
     for (i, slot) in perm2.iter_mut().enumerate() {
       let (mut x, mut p) = (i, 0usize);
       for _ in 0..count {
         p = (p << 2) | (x & 3);
         x >>= 2;
       }
-      *slot = (2 * p) as u16;
+      *slot = (2 * p) as u32;
     }
     let trig = |num: usize, den: usize| -> (f64, f64) {
       let phase = std::f64::consts::TAU * num as f64 / den as f64;
@@ -651,7 +652,7 @@ impl Rfft8F64 {
       stages.push((stride, tw));
       stride = group;
     }
-    let unpack = (1..m / 2)
+    let unpack = (1..=(m - 1) / 2)
       .map(|k| {
         let (c, s) = trig(k, n);
         [c, s]
@@ -709,14 +710,14 @@ impl Rfft8F64 {
     power[m] = pm;
     power[half] = ph;
 
-    let (p_lo, p_hi) = power[1..m].split_at_mut(half);
-    let p_lo = &mut p_lo[..half - 1];
-    let hi_start = p_hi.len() - (half - 1);
+    let pairs = (m - 1) / 2;
+    let (p_lo, p_hi) = power[1..m].split_at_mut(pairs);
+    let hi_start = p_hi.len() - pairs;
     let p_hi = &mut p_hi[hi_start..];
-    let re_lo = &re[1..half];
-    let re_hi = &re[m - (half - 1)..m];
-    let im_lo = &im[1..half];
-    let im_hi = &im[m - (half - 1)..m];
+    let re_lo = &re[1..1 + pairs];
+    let re_hi = &re[m - pairs..m];
+    let im_lo = &im[1..1 + pairs];
+    let im_hi = &im[m - pairs..m];
     for ((((&ar, &ai), (&br, &bi)), (pk, pmk)), &[c, s]) in re_lo
       .iter()
       .zip(im_lo)
@@ -761,7 +762,7 @@ fn gather_pair8_f64(fs: [&[f64]; 8], p: usize) -> ([f64; 8], [f64; 8]) {
 fn gather_windowed_f64(
   fs: [&[f64]; 8],
   w: &[f64],
-  perm2: &[u16],
+  perm2: &[u32],
   re: &mut [[f64; 8]],
   im: &mut [[f64; 8]],
 ) {
@@ -936,7 +937,7 @@ mod tests {
 
   #[test]
   fn matches_a_dft() {
-    for n in [320, 400, 512] {
+    for n in [4, 10, 320, 400, 512] {
       check_rfft8(n);
     }
     let n = 512;
@@ -969,13 +970,16 @@ mod tests {
     let mut max_ulp = 0u32;
     let mut max_abs = 0f32;
     let mut x = 1e-10f32;
+    let ordered = |v: f32| {
+      let b = v.to_bits();
+      if b & 0x8000_0000 != 0 { !b } else { b ^ 0x8000_0000 }
+    };
     while x <= 1e10 {
       let got = crate::cpu::ops::ln(x);
       let want = x.ln();
+      assert!(got.is_finite(), "ln({x}) returned non-finite {got}");
       max_abs = max_abs.max((got - want).abs());
-      if got.is_sign_positive() == want.is_sign_positive() {
-        max_ulp = max_ulp.max(got.to_bits().abs_diff(want.to_bits()));
-      }
+      max_ulp = max_ulp.max(ordered(got).abs_diff(ordered(want)));
       x *= 1.0001;
     }
     assert!(max_ulp <= 3 && max_abs < 2e-6, "ln max_ulp={max_ulp}, max_abs={max_abs:e}");
