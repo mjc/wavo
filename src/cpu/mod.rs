@@ -56,7 +56,7 @@ pub fn dot(a: &[f32], b: &[f32]) -> f32 {
     let mut acc = [0f32; 16];
     for (x, y) in a16.iter().zip(b16) {
       for ((s, x), y) in acc.iter_mut().zip(x).zip(y) {
-        *s = x.mul_add(*y, *s);
+        *s = ops::fma(*x, *y, *s);
       }
     }
 

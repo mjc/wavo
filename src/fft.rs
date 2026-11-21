@@ -6,6 +6,8 @@
 //! - `Rfft8F64`: 8-frame batched `f64` real-to-complex FFT for power-of-4 half-sizes (`512 -> 256`)
 //!   with stage 0 fused into the windowed gather.
 
+use crate::cpu::ops::{fma, fma64};
+
 /// Stores eight `f32` power values into `dst` (as `f32` or widened to `f64`).
 pub trait PowerOut: Copy + Default {
   fn store8(v: [f32; 8], dst: &mut [Self; 8]);
@@ -145,37 +147,6 @@ impl Rfft8 {
     im: &mut [[f32; 8]],
     power: &mut [[P; 8]],
   ) {
-    #[cfg(target_arch = "x86_64")]
-    if is_x86_feature_detected!("fma") {
-      // SAFETY: the CPU has FMA.
-      unsafe { self.power_windowed_fma(frames, window, re, im, power) };
-      return;
-    }
-    self.run_power_windowed(frames, window, re, im, power);
-  }
-
-  #[cfg(target_arch = "x86_64")]
-  #[target_feature(enable = "fma")]
-  fn power_windowed_fma<P: PowerOut>(
-    &self,
-    frames: [&[f32]; 8],
-    window: &[f32],
-    re: &mut [[f32; 8]],
-    im: &mut [[f32; 8]],
-    power: &mut [[P; 8]],
-  ) {
-    self.run_power_windowed(frames, window, re, im, power);
-  }
-
-  #[inline(always)]
-  fn run_power_windowed<P: PowerOut>(
-    &self,
-    frames: [&[f32]; 8],
-    window: &[f32],
-    re: &mut [[f32; 8]],
-    im: &mut [[f32; 8]],
-    power: &mut [[P; 8]],
-  ) {
     let n = self.n;
     let m = n / 2;
     let fs = [
@@ -230,7 +201,7 @@ impl Rfft8 {
       let (rm, imv) = (re[half], im[half]);
       let mut pm = [0f32; 8];
       for l in 0..8 {
-        pm[l] = rm[l].mul_add(rm[l], imv[l] * imv[l]);
+        pm[l] = fma(rm[l], rm[l], imv[l] * imv[l]);
       }
       P::store8(pm, &mut power[half]);
     }
@@ -256,14 +227,14 @@ impl Rfft8 {
         let ei = ai[l] - bi[l];
         let or = ai[l] + bi[l];
         let oi = br[l] - ar[l];
-        let tr = oi.mul_add(s, or * c);
-        let ti = (-or).mul_add(s, oi * c);
+        let tr = fma(oi, s, or * c);
+        let ti = fma(-or, s, oi * c);
         let xkr = er + tr;
         let xki = ei + ti;
         let xmr = er - tr;
         let xmi = ti - ei;
-        vk[l] = xkr.mul_add(xkr, xki * xki) * 0.25;
-        vmk[l] = xmr.mul_add(xmr, xmi * xmi) * 0.25;
+        vk[l] = fma(xkr, xkr, xki * xki) * 0.25;
+        vmk[l] = fma(xmr, xmr, xmi * xmi) * 0.25;
       }
       P::store8(vk, pk);
       P::store8(vmk, pmk);
@@ -307,8 +278,8 @@ fn gather_windowed_f32(
 
 #[inline(never)]
 fn stage0_r2(re: &mut [[f32; 8]], im: &mut [[f32; 8]]) {
-  let (mut cr, mut ci) = (re.chunks_exact_mut(4), im.chunks_exact_mut(4));
-  for (gr, gi) in cr.by_ref().zip(ci.by_ref()) {
+  let ((cr, rem_r), (ci, rem_i)) = (re.as_chunks_mut::<4>(), im.as_chunks_mut::<4>());
+  for (gr, gi) in cr.iter_mut().zip(ci) {
     let (z0r, z1r, z2r, z3r) = (gr[0], gr[1], gr[2], gr[3]);
     let (z0i, z1i, z2i, z3i) = (gi[0], gi[1], gi[2], gi[3]);
     let (mut y0r, mut y1r, mut y2r, mut y3r) = ([0f32; 8], [0f32; 8], [0f32; 8], [0f32; 8]);
@@ -332,9 +303,7 @@ fn stage0_r2(re: &mut [[f32; 8]], im: &mut [[f32; 8]]) {
     gi[2] = y2i;
     gi[3] = y3i;
   }
-  for (gr, gi) in
-    cr.into_remainder().chunks_exact_mut(2).zip(ci.into_remainder().chunks_exact_mut(2))
-  {
+  for (gr, gi) in rem_r.as_chunks_mut::<2>().0.iter_mut().zip(rem_i.as_chunks_mut::<2>().0) {
     let (z0r, z1r, z0i, z1i) = (gr[0], gr[1], gi[0], gi[1]);
     for l in 0..8 {
       gr[0][l] = z0r[l] + z1r[l];
@@ -348,8 +317,8 @@ fn stage0_r2(re: &mut [[f32; 8]], im: &mut [[f32; 8]]) {
 #[inline(never)]
 fn stage0_r4(re: &mut [[f32; 8]], im: &mut [[f32; 8]]) {
   // Process two 4-point groups per inner loop so LLVM loop-vectorizes rather than full-unrolling.
-  let (mut cr, mut ci) = (re.chunks_exact_mut(8), im.chunks_exact_mut(8));
-  for (gr, gi) in cr.by_ref().zip(ci.by_ref()) {
+  let ((cr, rem_r), (ci, rem_i)) = (re.as_chunks_mut::<8>(), im.as_chunks_mut::<8>());
+  for (gr, gi) in cr.iter_mut().zip(ci) {
     let (x0r, x1r, x2r, x3r) = (gr[0], gr[1], gr[2], gr[3]);
     let (x0i, x1i, x2i, x3i) = (gi[0], gi[1], gi[2], gi[3]);
     let (x4r, x5r, x6r, x7r) = (gr[4], gr[5], gr[6], gr[7]);
@@ -402,9 +371,7 @@ fn stage0_r4(re: &mut [[f32; 8]], im: &mut [[f32; 8]]) {
     gi[6] = y6i;
     gi[7] = y7i;
   }
-  for (gr, gi) in
-    cr.into_remainder().chunks_exact_mut(4).zip(ci.into_remainder().chunks_exact_mut(4))
-  {
+  for (gr, gi) in rem_r.as_chunks_mut::<4>().0.iter_mut().zip(rem_i.as_chunks_mut::<4>().0) {
     let (x0r, x1r, x2r, x3r) = (gr[0], gr[1], gr[2], gr[3]);
     let (x0i, x1i, x2i, x3i) = (gi[0], gi[1], gi[2], gi[3]);
     for l in 0..8 {
@@ -436,8 +403,12 @@ fn load_stage_r5(
   const S1: f32 = 0.951_056_54;
   const C2: f32 = -0.809_017;
   const S2: f32 = 0.587_785_24;
-  for ((gr, gi), ps) in
-    re.chunks_exact_mut(5).zip(im.chunks_exact_mut(5)).zip(perm2.chunks_exact(5))
+  for ((gr, gi), ps) in re
+    .as_chunks_mut::<5>()
+    .0
+    .iter_mut()
+    .zip(im.as_chunks_mut::<5>().0)
+    .zip(perm2.as_chunks::<5>().0)
   {
     let (p0, p1, p2, p3, p4) =
       (ps[0] as usize, ps[1] as usize, ps[2] as usize, ps[3] as usize, ps[4] as usize);
@@ -464,14 +435,14 @@ fn load_stage_r5(
       let (t4r, t4i) = (z2r - z3r, z2i - z3i);
       y0r[l] = z0r + (t1r + t2r);
       y0i[l] = z0i + (t1i + t2i);
-      let m1r = t2r.mul_add(C2, t1r.mul_add(C1, z0r));
-      let m1i = t2i.mul_add(C2, t1i.mul_add(C1, z0i));
-      let m2r = t2r.mul_add(C1, t1r.mul_add(C2, z0r));
-      let m2i = t2i.mul_add(C1, t1i.mul_add(C2, z0i));
-      let m3r = t4i.mul_add(S2, t3i * S1);
-      let m3i = t4r.mul_add(S2, t3r * S1);
-      let m4r = (-t4i).mul_add(S1, t3i * S2);
-      let m4i = (-t4r).mul_add(S1, t3r * S2);
+      let m1r = fma(t2r, C2, fma(t1r, C1, z0r));
+      let m1i = fma(t2i, C2, fma(t1i, C1, z0i));
+      let m2r = fma(t2r, C1, fma(t1r, C2, z0r));
+      let m2i = fma(t2i, C1, fma(t1i, C2, z0i));
+      let m3r = fma(t4i, S2, t3i * S1);
+      let m3i = fma(t4r, S2, t3r * S1);
+      let m4r = fma(-t4i, S1, t3i * S2);
+      let m4i = fma(-t4r, S1, t3r * S2);
       y1r[l] = m1r + m3r;
       y1i[l] = m1i - m3i;
       y2r[l] = m2r + m4r;
@@ -506,8 +477,8 @@ fn stage_r2(re: &mut [[f32; 8]], im: &mut [[f32; 8]], stride: usize, tw: &[[f32;
       let (xa, xb, xc, xd) = (*a, *b, *c, *d);
       let (mut ya, mut yb, mut yc, mut yd) = ([0f32; 8], [0f32; 8], [0f32; 8], [0f32; 8]);
       for l in 0..8 {
-        let tr = xd[l].mul_add(ws, xb[l] * wc);
-        let ti = (-xb[l]).mul_add(ws, xd[l] * wc);
+        let tr = fma(xd[l], ws, xb[l] * wc);
+        let ti = fma(-xb[l], ws, xd[l] * wc);
         ya[l] = xa[l] + tr;
         yb[l] = xa[l] - tr;
         yc[l] = xc[l] + ti;
@@ -538,9 +509,9 @@ fn stage_r4(re: &mut [[f32; 8]], im: &mut [[f32; 8]], stride: usize, tw: &[[f32;
       let (mut y0i, mut y1i, mut y2i, mut y3i) = ([0f32; 8], [0f32; 8], [0f32; 8], [0f32; 8]);
       for l in 0..8 {
         let (z0r, z0i) = (x0r[l], x0i[l]);
-        let (z1r, z1i) = (x1i[l].mul_add(s1, x1r[l] * c1), (-x1r[l]).mul_add(s1, x1i[l] * c1));
-        let (z2r, z2i) = (x2i[l].mul_add(s2, x2r[l] * c2), (-x2r[l]).mul_add(s2, x2i[l] * c2));
-        let (z3r, z3i) = (x3i[l].mul_add(s3, x3r[l] * c3), (-x3r[l]).mul_add(s3, x3i[l] * c3));
+        let (z1r, z1i) = (fma(x1i[l], s1, x1r[l] * c1), fma(-x1r[l], s1, x1i[l] * c1));
+        let (z2r, z2i) = (fma(x2i[l], s2, x2r[l] * c2), fma(-x2r[l], s2, x2i[l] * c2));
+        let (z3r, z3i) = (fma(x3i[l], s3, x3r[l] * c3), fma(-x3r[l], s3, x3i[l] * c3));
         let (a0r, a0i) = (z0r + z2r, z0i + z2i);
         let (a1r, a1i) = (z0r - z2r, z0i - z2i);
         let (b0r, b0i) = (z1r + z3r, z1i + z3i);
@@ -591,24 +562,24 @@ fn stage_r5(re: &mut [[f32; 8]], im: &mut [[f32; 8]], stride: usize, tw: &[[f32;
         ([0f32; 8], [0f32; 8], [0f32; 8], [0f32; 8], [0f32; 8]);
       for l in 0..8 {
         let (z0r, z0i) = (x0r[l], x0i[l]);
-        let (z1r, z1i) = (x1i[l].mul_add(s1, x1r[l] * c1), (-x1r[l]).mul_add(s1, x1i[l] * c1));
-        let (z2r, z2i) = (x2i[l].mul_add(s2, x2r[l] * c2), (-x2r[l]).mul_add(s2, x2i[l] * c2));
-        let (z3r, z3i) = (x3i[l].mul_add(s3, x3r[l] * c3), (-x3r[l]).mul_add(s3, x3i[l] * c3));
-        let (z4r, z4i) = (x4i[l].mul_add(s4, x4r[l] * c4), (-x4r[l]).mul_add(s4, x4i[l] * c4));
+        let (z1r, z1i) = (fma(x1i[l], s1, x1r[l] * c1), fma(-x1r[l], s1, x1i[l] * c1));
+        let (z2r, z2i) = (fma(x2i[l], s2, x2r[l] * c2), fma(-x2r[l], s2, x2i[l] * c2));
+        let (z3r, z3i) = (fma(x3i[l], s3, x3r[l] * c3), fma(-x3r[l], s3, x3i[l] * c3));
+        let (z4r, z4i) = (fma(x4i[l], s4, x4r[l] * c4), fma(-x4r[l], s4, x4i[l] * c4));
         let (t1r, t1i) = (z1r + z4r, z1i + z4i);
         let (t2r, t2i) = (z2r + z3r, z2i + z3i);
         let (t3r, t3i) = (z1r - z4r, z1i - z4i);
         let (t4r, t4i) = (z2r - z3r, z2i - z3i);
         y0r[l] = z0r + (t1r + t2r);
         y0i[l] = z0i + (t1i + t2i);
-        let m1r = t2r.mul_add(C2, t1r.mul_add(C1, z0r));
-        let m1i = t2i.mul_add(C2, t1i.mul_add(C1, z0i));
-        let m2r = t2r.mul_add(C1, t1r.mul_add(C2, z0r));
-        let m2i = t2i.mul_add(C1, t1i.mul_add(C2, z0i));
-        let m3r = t4i.mul_add(S2, t3i * S1);
-        let m3i = t4r.mul_add(S2, t3r * S1);
-        let m4r = (-t4i).mul_add(S1, t3i * S2);
-        let m4i = (-t4r).mul_add(S1, t3r * S2);
+        let m1r = fma(t2r, C2, fma(t1r, C1, z0r));
+        let m1i = fma(t2i, C2, fma(t1i, C1, z0i));
+        let m2r = fma(t2r, C1, fma(t1r, C2, z0r));
+        let m2i = fma(t2i, C1, fma(t1i, C2, z0i));
+        let m3r = fma(t4i, S2, t3i * S1);
+        let m3i = fma(t4r, S2, t3r * S1);
+        let m4r = fma(-t4i, S1, t3i * S2);
+        let m4i = fma(-t4r, S1, t3r * S2);
         y1r[l] = m1r + m3r;
         y1i[l] = m1i - m3i;
         y2r[l] = m2r + m4r;
@@ -698,37 +669,6 @@ impl Rfft8F64 {
     im: &mut [[f64; 8]],
     power: &mut [[f32; 8]],
   ) {
-    #[cfg(target_arch = "x86_64")]
-    if is_x86_feature_detected!("fma") {
-      // SAFETY: the CPU has FMA.
-      unsafe { self.power_windowed_f32_fma(frames, window, re, im, power) };
-      return;
-    }
-    self.run_power_windowed_f32(frames, window, re, im, power);
-  }
-
-  #[cfg(target_arch = "x86_64")]
-  #[target_feature(enable = "fma")]
-  fn power_windowed_f32_fma(
-    &self,
-    frames: [&[f64]; 8],
-    window: &[f64],
-    re: &mut [[f64; 8]],
-    im: &mut [[f64; 8]],
-    power: &mut [[f32; 8]],
-  ) {
-    self.run_power_windowed_f32(frames, window, re, im, power);
-  }
-
-  #[inline(always)]
-  fn run_power_windowed_f32(
-    &self,
-    frames: [&[f64]; 8],
-    window: &[f64],
-    re: &mut [[f64; 8]],
-    im: &mut [[f64; 8]],
-    power: &mut [[f32; 8]],
-  ) {
     let n = self.n;
     let m = n / 2;
     let fs = [
@@ -763,7 +703,7 @@ impl Rfft8F64 {
       let nyq = r0[l] - i0[l];
       p0[l] = (dc * dc) as f32;
       pm[l] = (nyq * nyq) as f32;
-      ph[l] = rm[l].mul_add(rm[l], imv[l] * imv[l]) as f32;
+      ph[l] = fma64(rm[l], rm[l], imv[l] * imv[l]) as f32;
     }
     power[0] = p0;
     power[m] = pm;
@@ -790,14 +730,14 @@ impl Rfft8F64 {
         let ei = ai[l] - bi[l];
         let or = ai[l] + bi[l];
         let oi = br[l] - ar[l];
-        let tr = oi.mul_add(s, or * c);
-        let ti = (-or).mul_add(s, oi * c);
+        let tr = fma64(oi, s, or * c);
+        let ti = fma64(-or, s, oi * c);
         let xkr = er + tr;
         let xki = ei + ti;
         let xmr = er - tr;
         let xmi = ti - ei;
-        vk[l] = (xkr.mul_add(xkr, xki * xki) * 0.25) as f32;
-        vmk[l] = (xmr.mul_add(xmr, xmi * xmi) * 0.25) as f32;
+        vk[l] = (fma64(xkr, xkr, xki * xki) * 0.25) as f32;
+        vmk[l] = (fma64(xmr, xmr, xmi * xmi) * 0.25) as f32;
       }
       *pk = vk;
       *pmk = vmk;
@@ -842,8 +782,8 @@ fn gather_windowed_f64(
 #[inline(never)]
 fn stage0_r4_f64(re: &mut [[f64; 8]], im: &mut [[f64; 8]]) {
   // Process two 4-point groups per inner loop so LLVM loop-vectorizes rather than full-unrolling.
-  let (mut cr, mut ci) = (re.chunks_exact_mut(8), im.chunks_exact_mut(8));
-  for (gr, gi) in cr.by_ref().zip(ci.by_ref()) {
+  let ((cr, rem_r), (ci, rem_i)) = (re.as_chunks_mut::<8>(), im.as_chunks_mut::<8>());
+  for (gr, gi) in cr.iter_mut().zip(ci) {
     let (x0r, x1r, x2r, x3r) = (gr[0], gr[1], gr[2], gr[3]);
     let (x0i, x1i, x2i, x3i) = (gi[0], gi[1], gi[2], gi[3]);
     let (x4r, x5r, x6r, x7r) = (gr[4], gr[5], gr[6], gr[7]);
@@ -896,9 +836,7 @@ fn stage0_r4_f64(re: &mut [[f64; 8]], im: &mut [[f64; 8]]) {
     gi[6] = y6i;
     gi[7] = y7i;
   }
-  for (gr, gi) in
-    cr.into_remainder().chunks_exact_mut(4).zip(ci.into_remainder().chunks_exact_mut(4))
-  {
+  for (gr, gi) in rem_r.as_chunks_mut::<4>().0.iter_mut().zip(rem_i.as_chunks_mut::<4>().0) {
     let (x0r, x1r, x2r, x3r) = (gr[0], gr[1], gr[2], gr[3]);
     let (x0i, x1i, x2i, x3i) = (gi[0], gi[1], gi[2], gi[3]);
     for l in 0..8 {
@@ -935,9 +873,9 @@ fn stage_r4_f64(re: &mut [[f64; 8]], im: &mut [[f64; 8]], stride: usize, tw: &[[
       let (mut y0i, mut y1i, mut y2i, mut y3i) = ([0f64; 8], [0f64; 8], [0f64; 8], [0f64; 8]);
       for l in 0..8 {
         let (z0r, z0i) = (x0r[l], x0i[l]);
-        let (z1r, z1i) = (x1i[l].mul_add(s1, x1r[l] * c1), (-x1r[l]).mul_add(s1, x1i[l] * c1));
-        let (z2r, z2i) = (x2i[l].mul_add(s2, x2r[l] * c2), (-x2r[l]).mul_add(s2, x2i[l] * c2));
-        let (z3r, z3i) = (x3i[l].mul_add(s3, x3r[l] * c3), (-x3r[l]).mul_add(s3, x3i[l] * c3));
+        let (z1r, z1i) = (fma64(x1i[l], s1, x1r[l] * c1), fma64(-x1r[l], s1, x1i[l] * c1));
+        let (z2r, z2i) = (fma64(x2i[l], s2, x2r[l] * c2), fma64(-x2r[l], s2, x2i[l] * c2));
+        let (z3r, z3i) = (fma64(x3i[l], s3, x3r[l] * c3), fma64(-x3r[l], s3, x3i[l] * c3));
         let (a0r, a0i) = (z0r + z2r, z0i + z2i);
         let (a1r, a1i) = (z0r - z2r, z0i - z2i);
         let (b0r, b0i) = (z1r + z3r, z1i + z3i);
