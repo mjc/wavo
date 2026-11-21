@@ -542,8 +542,8 @@ two numbers (A/B/A, warm median unless stated), kept or rejected and why.
     plus 4× `kk`-unrolled `vfmaq_laneq_f32` f32 NEON tile, 4×4 transposed `Linear::pack` and
     `panels`, per-worker persistent thread pool (`p_cores()` for bandwidth-bound `gemv`/`matvecs`
     and frontends, `threads()` for `gemm`), 128-bit NEON `dot`, full-block `Q8::rows`, Estrin
-    `ops::exp`/`gelu`, 16-lane pairwise `moments`/`softmax`/`attend`, vectorized `rope`/`group_norm`/
-    `im2col`, and benchmark-only macOS P-core QoS (`QOS_CLASS_USER_INTERACTIVE` in `wavo bench`).
+    `ops::exp`/`gelu`, 16-lane pairwise `moments`/`softmax`/`attend`, and vectorized `rope`/
+    `group_norm`/`im2col`.
   - Quiet M1 back-to-back A/B against `085e861` (`wavo bench --backend cpu`, warm median ms):
     `whisper-large-v3-turbo` `jfk` 8938.3 → 4852.3 (1.84×; `WAVO-DOC-2` settled 8574.9 → 4852.3),
     `gigaam-v3` `ru-short` 557.0 → 268.5 (2.07×), `parakeet-v2` `jfk` 772.4 → 388.7 (1.99×),
