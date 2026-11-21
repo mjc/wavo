@@ -307,8 +307,8 @@ fn gather_windowed_f32(
 
 #[inline(never)]
 fn stage0_r2(re: &mut [[f32; 8]], im: &mut [[f32; 8]]) {
-  let (mut cr, mut ci) = (re.chunks_exact_mut(4), im.chunks_exact_mut(4));
-  for (gr, gi) in cr.by_ref().zip(ci.by_ref()) {
+  let ((cr, rem_r), (ci, rem_i)) = (re.as_chunks_mut::<4>(), im.as_chunks_mut::<4>());
+  for (gr, gi) in cr.iter_mut().zip(ci) {
     let (z0r, z1r, z2r, z3r) = (gr[0], gr[1], gr[2], gr[3]);
     let (z0i, z1i, z2i, z3i) = (gi[0], gi[1], gi[2], gi[3]);
     let (mut y0r, mut y1r, mut y2r, mut y3r) = ([0f32; 8], [0f32; 8], [0f32; 8], [0f32; 8]);
@@ -332,9 +332,7 @@ fn stage0_r2(re: &mut [[f32; 8]], im: &mut [[f32; 8]]) {
     gi[2] = y2i;
     gi[3] = y3i;
   }
-  for (gr, gi) in
-    cr.into_remainder().chunks_exact_mut(2).zip(ci.into_remainder().chunks_exact_mut(2))
-  {
+  for (gr, gi) in rem_r.as_chunks_mut::<2>().0.iter_mut().zip(rem_i.as_chunks_mut::<2>().0) {
     let (z0r, z1r, z0i, z1i) = (gr[0], gr[1], gi[0], gi[1]);
     for l in 0..8 {
       gr[0][l] = z0r[l] + z1r[l];
@@ -348,8 +346,8 @@ fn stage0_r2(re: &mut [[f32; 8]], im: &mut [[f32; 8]]) {
 #[inline(never)]
 fn stage0_r4(re: &mut [[f32; 8]], im: &mut [[f32; 8]]) {
   // Process two 4-point groups per inner loop so LLVM loop-vectorizes rather than full-unrolling.
-  let (mut cr, mut ci) = (re.chunks_exact_mut(8), im.chunks_exact_mut(8));
-  for (gr, gi) in cr.by_ref().zip(ci.by_ref()) {
+  let ((cr, rem_r), (ci, rem_i)) = (re.as_chunks_mut::<8>(), im.as_chunks_mut::<8>());
+  for (gr, gi) in cr.iter_mut().zip(ci) {
     let (x0r, x1r, x2r, x3r) = (gr[0], gr[1], gr[2], gr[3]);
     let (x0i, x1i, x2i, x3i) = (gi[0], gi[1], gi[2], gi[3]);
     let (x4r, x5r, x6r, x7r) = (gr[4], gr[5], gr[6], gr[7]);
@@ -402,9 +400,7 @@ fn stage0_r4(re: &mut [[f32; 8]], im: &mut [[f32; 8]]) {
     gi[6] = y6i;
     gi[7] = y7i;
   }
-  for (gr, gi) in
-    cr.into_remainder().chunks_exact_mut(4).zip(ci.into_remainder().chunks_exact_mut(4))
-  {
+  for (gr, gi) in rem_r.as_chunks_mut::<4>().0.iter_mut().zip(rem_i.as_chunks_mut::<4>().0) {
     let (x0r, x1r, x2r, x3r) = (gr[0], gr[1], gr[2], gr[3]);
     let (x0i, x1i, x2i, x3i) = (gi[0], gi[1], gi[2], gi[3]);
     for l in 0..8 {
@@ -436,8 +432,12 @@ fn load_stage_r5(
   const S1: f32 = 0.951_056_54;
   const C2: f32 = -0.809_017;
   const S2: f32 = 0.587_785_24;
-  for ((gr, gi), ps) in
-    re.chunks_exact_mut(5).zip(im.chunks_exact_mut(5)).zip(perm2.chunks_exact(5))
+  for ((gr, gi), ps) in re
+    .as_chunks_mut::<5>()
+    .0
+    .iter_mut()
+    .zip(im.as_chunks_mut::<5>().0)
+    .zip(perm2.as_chunks::<5>().0)
   {
     let (p0, p1, p2, p3, p4) =
       (ps[0] as usize, ps[1] as usize, ps[2] as usize, ps[3] as usize, ps[4] as usize);
@@ -842,8 +842,8 @@ fn gather_windowed_f64(
 #[inline(never)]
 fn stage0_r4_f64(re: &mut [[f64; 8]], im: &mut [[f64; 8]]) {
   // Process two 4-point groups per inner loop so LLVM loop-vectorizes rather than full-unrolling.
-  let (mut cr, mut ci) = (re.chunks_exact_mut(8), im.chunks_exact_mut(8));
-  for (gr, gi) in cr.by_ref().zip(ci.by_ref()) {
+  let ((cr, rem_r), (ci, rem_i)) = (re.as_chunks_mut::<8>(), im.as_chunks_mut::<8>());
+  for (gr, gi) in cr.iter_mut().zip(ci) {
     let (x0r, x1r, x2r, x3r) = (gr[0], gr[1], gr[2], gr[3]);
     let (x0i, x1i, x2i, x3i) = (gi[0], gi[1], gi[2], gi[3]);
     let (x4r, x5r, x6r, x7r) = (gr[4], gr[5], gr[6], gr[7]);
@@ -896,9 +896,7 @@ fn stage0_r4_f64(re: &mut [[f64; 8]], im: &mut [[f64; 8]]) {
     gi[6] = y6i;
     gi[7] = y7i;
   }
-  for (gr, gi) in
-    cr.into_remainder().chunks_exact_mut(4).zip(ci.into_remainder().chunks_exact_mut(4))
-  {
+  for (gr, gi) in rem_r.as_chunks_mut::<4>().0.iter_mut().zip(rem_i.as_chunks_mut::<4>().0) {
     let (x0r, x1r, x2r, x3r) = (gr[0], gr[1], gr[2], gr[3]);
     let (x0i, x1i, x2i, x3i) = (gi[0], gi[1], gi[2], gi[3]);
     for l in 0..8 {

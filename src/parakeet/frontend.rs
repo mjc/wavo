@@ -72,7 +72,7 @@ impl Frontend {
     let n = frames - 1;
     let (body, last) = mel.split_at_mut(n * MELS);
     let mut mean = [0.0f64; MELS];
-    for row in body.chunks_exact(MELS) {
+    for row in body.as_chunks::<MELS>().0 {
       for (m, &x) in mean.iter_mut().zip(row) {
         *m += x as f64;
       }
@@ -82,7 +82,7 @@ impl Frontend {
       *m *= inv_n;
     }
     let mut var = [0.0f64; MELS];
-    for row in body.chunks_exact(MELS) {
+    for row in body.as_chunks::<MELS>().0 {
       for ((v, &m), &x) in var.iter_mut().zip(&mean).zip(row) {
         let d = x as f64 - m;
         *v += d * d;
@@ -94,7 +94,7 @@ impl Frontend {
     for (iv, &v) in inv.iter_mut().zip(&var) {
       *iv = 1.0 / ((v * inv_nm1).sqrt() + eps);
     }
-    for row in body.chunks_exact_mut(MELS) {
+    for row in body.as_chunks_mut::<MELS>().0 {
       for ((x, &m), &iv) in row.iter_mut().zip(&mean).zip(&inv) {
         *x = ((*x as f64 - m) * iv) as f32;
       }
