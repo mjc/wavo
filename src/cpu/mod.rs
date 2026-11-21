@@ -7,7 +7,8 @@ pub mod gemm;
 pub mod ops;
 pub mod transformer;
 
-use std::sync::{Mutex, OnceLock, PoisonError};
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Condvar, Mutex, OnceLock, PoisonError};
 
 use half::f16;
 
@@ -76,6 +77,41 @@ pub fn device() -> &'static Device {
   })
 }
 
+/// Performance-core count on Apple Silicon (`hw.perflevel0.physicalcpu`), or `threads()` elsewhere.
+pub fn p_cores() -> usize {
+  static PCORES: OnceLock<usize> = OnceLock::new();
+  *PCORES.get_or_init(|| {
+    #[cfg(target_os = "macos")]
+    {
+      unsafe extern "C" {
+        fn sysctlbyname(
+          name: *const std::ffi::c_char,
+          oldp: *mut std::ffi::c_void,
+          oldlenp: *mut usize,
+          newp: *const std::ffi::c_void,
+          newlen: usize,
+        ) -> i32;
+      }
+      let mut n: u32 = 0;
+      let mut len = std::mem::size_of::<u32>();
+      // SAFETY: `name` is NUL-terminated and `oldp`/`oldlenp` point to `n`.
+      let rc = unsafe {
+        sysctlbyname(
+          c"hw.perflevel0.physicalcpu".as_ptr(),
+          (&mut n as *mut u32).cast(),
+          &mut len,
+          std::ptr::null(),
+          0,
+        )
+      };
+      if rc == 0 && n > 0 {
+        return n as usize;
+      }
+    }
+    threads()
+  })
+}
+
 /// Threads for the encoders' kernels: the CPUs this process may run on (`taskset` and cgroup
 /// limits count).
 pub fn threads() -> usize {
@@ -83,17 +119,140 @@ pub fn threads() -> usize {
   *THREADS.get_or_init(|| std::thread::available_parallelism().map_or(1, |n| n.get()))
 }
 
-/// `f(scratch, item)` for each item, on `threads` scoped threads (no more than there can be
-/// items) that take the next item as they come free, each with its own `scratch` from `init`.
-pub fn par_each<T: Send, S>(
+#[derive(Clone, Copy)]
+struct PoolJob {
+  func: fn(*const ()),
+  data: *const (),
+  generation: usize,
+}
+
+// SAFETY: `run_threads` waits until every woken worker finishes before `data` can go out of scope.
+unsafe impl Send for PoolJob {}
+
+struct Worker {
+  job: Mutex<PoolJob>,
+  wake: Condvar,
+}
+
+struct Pool {
+  workers: &'static [Worker],
+  done: &'static AtomicUsize,
+  busy: Mutex<()>,
+}
+
+fn pool() -> &'static Pool {
+  static POOL: OnceLock<Pool> = OnceLock::new();
+  POOL.get_or_init(|| {
+    let n = threads().saturating_sub(1);
+    let done: &'static AtomicUsize = Box::leak(Box::new(AtomicUsize::new(0)));
+    let workers: &'static [Worker] = Box::leak(
+      (0..n)
+        .map(|_| Worker {
+          job: Mutex::new(PoolJob { func: |_| {}, data: std::ptr::null(), generation: 0 }),
+          wake: Condvar::new(),
+        })
+        .collect::<Vec<_>>()
+        .into_boxed_slice(),
+    );
+    for (id, worker) in workers.iter().enumerate() {
+      let _ = std::thread::Builder::new().name(format!("wavo-cpu-{id}")).spawn(move || {
+        let mut seen = 0usize;
+        loop {
+          let job = {
+            let mut guard = worker.job.lock().unwrap_or_else(PoisonError::into_inner);
+            while guard.generation == seen {
+              guard = worker.wake.wait(guard).unwrap_or_else(PoisonError::into_inner);
+            }
+            seen = guard.generation;
+            *guard
+          };
+          let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| (job.func)(job.data)));
+          done.fetch_add(1, Ordering::Release);
+        }
+      });
+    }
+    Pool { workers, done, busy: Mutex::new(()) }
+  })
+}
+
+/// Runs `work(tid)` on `n` threads (`0..n`, with `0` on the calling thread), using the persistent
+/// worker pool when uncontended and falling back to `std::thread::scope` if nested or busy.
+pub fn run_threads<F: Fn(usize) + Sync>(n: usize, work: &F) {
+  if n <= 1 {
+    work(0);
+    return;
+  }
+  let p = pool();
+  let extra = (n - 1).min(p.workers.len());
+  if extra > 0
+    && let Ok(_busy) = p.busy.try_lock()
+  {
+    struct Runner<'a, F: Fn(usize) + Sync> {
+      work: &'a F,
+      next_id: AtomicUsize,
+    }
+    fn invoke<F: Fn(usize) + Sync>(ptr: *const ()) {
+      // SAFETY: `ptr` points to `Runner<F>` alive until `WaitGuard::drop` completes.
+      let r = unsafe { &*ptr.cast::<Runner<'_, F>>() };
+      let tid = r.next_id.fetch_add(1, Ordering::Relaxed);
+      (r.work)(tid);
+    }
+    struct WaitGuard<'a> {
+      done: &'a AtomicUsize,
+      expected: usize,
+    }
+    impl Drop for WaitGuard<'_> {
+      fn drop(&mut self) {
+        let mut spins = 0u32;
+        while self.done.load(Ordering::Acquire) < self.expected {
+          spins += 1;
+          if spins < 256 {
+            std::hint::spin_loop();
+          } else {
+            std::thread::yield_now();
+          }
+        }
+      }
+    }
+
+    let runner = Runner { work, next_id: AtomicUsize::new(1) };
+    let data = (&runner as *const Runner<'_, _>).cast();
+    p.done.store(0, Ordering::Relaxed);
+    for worker in &p.workers[..extra] {
+      {
+        let mut guard = worker.job.lock().unwrap_or_else(PoisonError::into_inner);
+        guard.func = invoke::<F>;
+        guard.data = data;
+        guard.generation = guard.generation.wrapping_add(1);
+      }
+      worker.wake.notify_one();
+    }
+    let _wait = WaitGuard { done: p.done, expected: extra };
+    work(0);
+    return;
+  }
+
+  std::thread::scope(|s| {
+    for tid in 1..n {
+      s.spawn(move || work(tid));
+    }
+    work(0);
+  });
+}
+
+/// `f(scratch, item)` for each item, on at most `max_threads` worker threads (no more than there
+/// can be items) that take the next item as they come free, each with its own `scratch` from
+/// `init`.
+pub fn par_each_n<T: Send, S>(
+  max_threads: usize,
   items: impl Iterator<Item = T> + Send,
   init: impl Fn() -> S + Sync,
   f: impl Fn(&mut S, T) + Sync,
 ) {
-  let spawn = threads().min(items.size_hint().1.unwrap_or(usize::MAX));
+  let spawn = max_threads.max(1).min(items.size_hint().1.unwrap_or(usize::MAX));
   let items = Mutex::new(items);
   let next = || items.lock().unwrap_or_else(PoisonError::into_inner).next();
-  let work = || {
+  let work = |_| {
     let Some(first) = next() else { return };
     let mut scratch = init();
     f(&mut scratch, first);
@@ -101,13 +260,17 @@ pub fn par_each<T: Send, S>(
       f(&mut scratch, item);
     }
   };
-  std::thread::scope(|s| {
-    for _ in 1..spawn {
-      s.spawn(work);
-    }
+  run_threads(spawn, &work);
+}
 
-    work();
-  });
+/// `f(scratch, item)` for each item, on `threads` worker threads (no more than there can be
+/// items) that take the next item as they come free, each with its own `scratch` from `init`.
+pub fn par_each<T: Send, S>(
+  items: impl Iterator<Item = T> + Send,
+  init: impl Fn() -> S + Sync,
+  f: impl Fn(&mut S, T) + Sync,
+) {
+  par_each_n(threads(), items, init, f);
 }
 
 /// `w` (`k`-long rows) padded with zero rows to a multiple of 4, as `matmul` takes it.
@@ -453,18 +616,12 @@ pub fn matvecs<const N: usize>(jobs: [(&Matrix, &[f32]); N]) -> [Vec<f32>; N] {
   });
   let blocks = Mutex::new(blocks);
   let next = || blocks.lock().unwrap_or_else(PoisonError::into_inner).next();
-  let work = || {
+  let work = |_| {
     while let Some((w, x, r0, out)) = next() {
       w.rows(r0, x, out);
     }
   };
-  std::thread::scope(|s| {
-    for _ in 1..4 {
-      s.spawn(work);
-    }
-
-    work();
-  });
+  run_threads(p_cores().min(4), &work);
   out
 }
 

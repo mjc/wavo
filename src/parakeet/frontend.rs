@@ -112,19 +112,18 @@ impl Frontend {
     }
     let mut mel = vec![0f32; n_frames * MELS];
     if n_frames >= PAR_MIN_FRAMES {
-      let per_frames = n_frames.div_ceil(4).next_multiple_of(8);
+      let n_threads = crate::cpu::p_cores().clamp(1, 4);
+      let per_frames = n_frames.div_ceil(n_threads).next_multiple_of(8);
       let per = per_frames * MELS;
-      std::thread::scope(|s| {
-        let mut iter = mel.chunks_mut(per).enumerate();
-        let first = iter.next();
-        for (i, slice) in iter {
-          let f0 = frames.start + i * per_frames;
-          s.spawn(move || self.log_mel_range(pcm, f0, slice));
-        }
-        if let Some((i, slice)) = first {
-          self.log_mel_range(pcm, frames.start + i * per_frames, slice);
-        }
-      });
+      let chunks: Vec<(usize, &mut [f32])> =
+        mel.chunks_mut(per).enumerate().map(|(i, s)| (frames.start + i * per_frames, s)).collect();
+      crate::cpu::par_each(
+        chunks.into_iter(),
+        || (),
+        |_, (f0, slice)| {
+          self.log_mel_range(pcm, f0, slice);
+        },
+      );
     } else {
       self.log_mel_range(pcm, frames.start, &mut mel);
     }

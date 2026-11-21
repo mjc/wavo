@@ -70,21 +70,20 @@ impl Frontend {
       frames
     };
     if active > 0 {
-      let per_frames = active.div_ceil(4).next_multiple_of(8);
+      let n_threads = crate::cpu::p_cores().clamp(1, 4);
+      let per_frames = active.div_ceil(n_threads).next_multiple_of(8);
       let per = per_frames * mels;
       let active_mel = &mut mel[..active * mels];
-      std::thread::scope(|s| {
-        let padded = &padded;
-        let mut iter = active_mel.chunks_mut(per).enumerate();
-        let first = iter.next();
-        for (i, out) in iter {
-          let frame0 = i * per_frames;
-          s.spawn(move || self.compute_range(padded, frame0, out, silent));
-        }
-        if let Some((i, out)) = first {
-          self.compute_range(padded, i * per_frames, out, silent);
-        }
-      });
+      let padded = &padded;
+      let chunks: Vec<(usize, &mut [f32])> =
+        active_mel.chunks_mut(per).enumerate().map(|(i, out)| (i * per_frames, out)).collect();
+      crate::cpu::par_each(
+        chunks.into_iter(),
+        || (),
+        |_, (frame0, out)| {
+          self.compute_range(padded, frame0, out, silent);
+        },
+      );
     }
     // Values are finite (clamped before log10), so a branchless lane max avoids NaN guards.
     let mut acc = [f32::NEG_INFINITY; 16];

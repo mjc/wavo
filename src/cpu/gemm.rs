@@ -15,7 +15,7 @@
 use half::f16;
 use half::slice::HalfFloatSliceExt;
 
-use super::{Q8, dot, ops, par_each};
+use super::{Q8, dot, ops, par_each, par_each_n};
 use crate::error::{Result, bail};
 use crate::gguf::{Tensor, Type};
 use crate::gpu::Epilogue;
@@ -177,12 +177,14 @@ pub fn gemm(a: &[f32], l: &Linear, c: &mut [f32], m: usize, epilogue: Epilogue) 
 }
 
 /// `c = epilogue(x·Wᵀ + b)` for one row `x` `[k]` into `c` `[n]`, in f32 as the GPU's `gemv`:
-/// blocks of rows on threads when there is enough work for them.
+/// blocks of rows on performance cores when there is enough work for them.
 pub fn gemv(x: &[f32], l: &Linear, c: &mut [f32], epilogue: Epilogue) {
   let k = l.k;
-  // At least 2^18 multiply-adds per block, a multiple of `Q8::rows`' 4 rows.
-  let rows = l.n.div_ceil(super::threads()).max((1 << 18) / k).next_multiple_of(4);
-  par_each(
+  let workers = super::p_cores();
+  // Fine-grained 64-row blocks (at least 2^17 multiply-adds) on memory-bandwidth-bound P-cores.
+  let rows = ((1 << 17) / k).max(64).min(l.n.div_ceil(workers).max(4)).next_multiple_of(4);
+  par_each_n(
+    workers,
     c[..l.n].chunks_mut(rows).enumerate(),
     || (vec![0.0; rows], vec![0.0; k]),
     |(acc, wide), (i, c)| {
