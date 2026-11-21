@@ -620,6 +620,7 @@ fn bench(model: &str, audio: &str, opts: &[&str]) -> Result<()> {
 
   let on = target(on, gpu)?;
   let (pcm, path) = (audio::read(audio)?, model_path(model, Download::Never, on)?);
+  wavo::bench_prefer_p_cores();
   let ms = |t: Instant| t.elapsed().as_secs_f64() * 1e3;
   let t = Instant::now();
   // The call: `diarize` for a diarization model.
