@@ -22,7 +22,8 @@ copies are submitted every 16 MB while the rest loads; weights stay Q8_0/F16 on 
 scales as f16. Apart from those copies, load runs nothing on the GPU but the fast-kernel probes,
 in one submission. Metal caches compiled pipelines across runs by shader source, so new shaders
 cost 0.2–0.4 s once. Per call: CPU log-mel
-(own FFT, one frame at a time), then the encoder over an arena sized for the longest input so far,
+(autovectorized 8-frame real mixed-radix FFT, compact sparse mel dot + Estrin `ln`, 4 threads on
+longer clips), then the encoder over an arena sized for the longest input so far,
 bind groups cached per dispatch: one submission with the fast kernels, one per layer on the
 portable path (`Pass::layers`). The fast kernels (cooperative-matrix GEMM on f16 operands with
 Q8_0/F16 dequantized while staging and W rounded to f16 as the reference does, barrier-free flash
@@ -634,6 +635,19 @@ first call 11.2 / 12.5 s, load 1.3–1.6 s, 0.55 GB (2 / 4 cores).
 
 ### Frontend and FFT
 
+- 2026-11-21, all models (Apple M1, synthetic 16 kHz audio, warm medians of 25): pure safe
+  autovectorized 8-frame batched real-to-complex mixed-radix `{2, 4, 5}` FFT (`Rfft8` / `Rfft8F64`,
+  local non-aliasing `[T; 8]` stages so every stage emits zero scalar float ops on ARM64 NEON),
+  compact sparse mel filterbank with 4×8 block transposes (`ops::mel_filter8_f32`/`f64`),
+  16-wide Estrin `ops::ln` (`ln_clamp_inplace`, `ln_add_inplace`, `log10_floor_inplace`),
+  L1-resident 32-frame pre-emphasis tiles and row-major NEON normalization in Parakeet, active-prefix
+  4-thread split in Whisper and thresholded 4-thread splits in GigaAM/Parakeet. GigaAM-64 4.5 / 11 /
+  33.8 s: 0.562 / 1.375 / 4.236 → 0.128 / 0.142 / 0.325 ms (4.4–13×); GigaAM-128 33.8 s: 5.461 →
+  0.372 ms (14.7×); Parakeet 5.3 / 11 / 35.3 s compute: 1.573 / 3.279 / 10.559 → 0.225 / 0.383 /
+  1.058 ms (7–10×; `log_mel` 35.3 s 9.136 → 0.798 ms, max 1 ULP); Whisper-80 11 / 30 s: 3.085 /
+  3.260 → 0.311 / 0.542 ms (6–10×); Whisper-128 30 / 33.8 s: 3.584 / 4.011 → 0.617 / 0.680 ms
+  (5.8–5.9×). Raw FFT per 1000 frames: 320 f32 0.636 → 0.200 ms, 400 f32 3.234 → 0.304 ms (10.6×,
+  eliminating O(25²) leaf), 512 f64 1.812 → 0.564 ms. Kept on `feat/log-mel-simd`.
 - 2026-10-10, all models, the own FFT with two radix-2 stages per pass (same butterflies, half
   the memory passes): 7945HX Parakeet jfk mel 4.24 / 4.22 / 4.28 / 4.16 ms, FFT 320 0.41 → 0.54
   µs. Rejected: no gain.

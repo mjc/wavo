@@ -9,6 +9,263 @@ use super::gemm::{NR, panels, product};
 use super::{dot, par_each};
 use crate::gpu::pos_rows;
 
+/// `ln(x)` for positive normal `x` (`>= 1e-10`) as Cephes' `logf` computes it (error <= 2 ULP),
+/// without branches or calls so loops of it autovectorize to NEON / AVX2. Uses Estrin's scheme
+/// to halve the FMA dependency chain depth.
+#[inline(always)]
+pub fn ln(x: f32) -> f32 {
+  const SQRT_HALF: u32 = 0x3f35_04f3;
+  let bits = x.to_bits().wrapping_sub(SQRT_HALF);
+  let e = (bits as i32 >> 23) as f32;
+  let m = f32::from_bits((bits & 0x007f_ffff) + SQRT_HALF);
+  let f = m - 1.0;
+  let f2 = f * f;
+  let f4 = f2 * f2;
+  let p01 = (-2.499_999_4e-1f32).mul_add(f, 3.333_333e-1);
+  let p23 = (-1.666_805_7e-1f32).mul_add(f, 2.000_071_5e-1);
+  let p45 = (-1.242_014_1e-1f32).mul_add(f, 1.424_932_3e-1);
+  let p67 = (-1.151_461e-1f32).mul_add(f, 1.167_699_9e-1);
+  let p03 = p23.mul_add(f2, p01);
+  let p47 = p67.mul_add(f2, p45);
+  let p48 = 7.037_683_6e-2f32.mul_add(f4, p47);
+  let p = p48.mul_add(f4, p03);
+  let poly = (p * f).mul_add(f2, (-0.5f32).mul_add(f2, f));
+  e.mul_add(0.693_359_4, e.mul_add(-2.121_944_4e-4, poly))
+}
+
+/// Applies `ln(x.clamp(lo, hi))` in place in 16-wide chunks so NEON constants stay in registers.
+#[inline(never)]
+pub fn ln_clamp_inplace(xs: &mut [f32], lo: f32, hi: f32) {
+  let (chunks, tail) = xs.as_chunks_mut::<16>();
+  for c in chunks {
+    for v in c.iter_mut() {
+      let x = if *v < lo {
+        lo
+      } else if *v > hi {
+        hi
+      } else {
+        *v
+      };
+      *v = ln(x);
+    }
+  }
+  for v in tail {
+    let x = if *v < lo {
+      lo
+    } else if *v > hi {
+      hi
+    } else {
+      *v
+    };
+    *v = ln(x);
+  }
+}
+
+/// Applies `ln(x + eps)` in place in 16-wide chunks so NEON constants stay in registers.
+#[inline(never)]
+pub fn ln_add_inplace(xs: &mut [f32], eps: f32) {
+  let (chunks, tail) = xs.as_chunks_mut::<16>();
+  for c in chunks {
+    for v in c.iter_mut() {
+      *v = ln(*v + eps);
+    }
+  }
+  for v in tail {
+    *v = ln(*v + eps);
+  }
+}
+
+/// Applies `log10(max(x, floor))` in place in 16-wide chunks so NEON constants stay in registers.
+#[inline(never)]
+pub fn log10_floor_inplace(xs: &mut [f32], floor: f32) {
+  let (chunks, tail) = xs.as_chunks_mut::<16>();
+  for c in chunks {
+    for v in c.iter_mut() {
+      let x = if *v < floor { floor } else { *v };
+      *v = ln(x) * std::f32::consts::LOG10_E;
+    }
+  }
+  for v in tail {
+    let x = if *v < floor { floor } else { *v };
+    *v = ln(x) * std::f32::consts::LOG10_E;
+  }
+}
+
+/// Applies compact sparse `f32` mel filterbank (`weights`, `spans`) to eight power spectra
+/// `power[bin][frame]` into `chunk` (`count` rows of `spans.len()` floats, `1..=8`), keeping
+/// exact bin-order FMA per filter and 4×8 block transposes for contiguous stores.
+pub fn mel_filter8_f32(
+  weights: &[f32],
+  spans: &[(u16, u16)],
+  power: &[[f32; 8]],
+  chunk: &mut [f32],
+  count: usize,
+) {
+  let mels = spans.len();
+  debug_assert!(chunk.len() == count * mels && (1..=8).contains(&count));
+
+  let mut off = 0usize;
+  if count == 8 {
+    let (r0, rest) = chunk.split_at_mut(mels);
+    let (r1, rest) = rest.split_at_mut(mels);
+    let (r2, rest) = rest.split_at_mut(mels);
+    let (r3, rest) = rest.split_at_mut(mels);
+    let (r4, rest) = rest.split_at_mut(mels);
+    let (r5, rest) = rest.split_at_mut(mels);
+    let (r6, r7) = rest.split_at_mut(mels);
+    let (spans4, spans_tail) = spans.as_chunks::<4>();
+    let ((d0, t0), (d1, t1)) = (r0.as_chunks_mut::<4>(), r1.as_chunks_mut::<4>());
+    let ((d2, t2), (d3, t3)) = (r2.as_chunks_mut::<4>(), r3.as_chunks_mut::<4>());
+    let ((d4, t4), (d5, t5)) = (r4.as_chunks_mut::<4>(), r5.as_chunks_mut::<4>());
+    let ((d6, t6), (d7, t7)) = (r6.as_chunks_mut::<4>(), r7.as_chunks_mut::<4>());
+    for (idx, sp) in spans4.iter().enumerate() {
+      let mut blk = [[0f32; 8]; 4];
+      for (slot, &(lo, len)) in blk.iter_mut().zip(sp) {
+        let (lo, len) = (lo as usize, len as usize);
+        let ws = &weights[off..off + len];
+        off += len;
+        let mut e = [0f32; 8];
+        for (&w, p) in ws.iter().zip(&power[lo..lo + len]) {
+          for (a, &p) in e.iter_mut().zip(p) {
+            *a = w.mul_add(p, *a);
+          }
+        }
+        *slot = e;
+      }
+      d0[idx] = [blk[0][0], blk[1][0], blk[2][0], blk[3][0]];
+      d1[idx] = [blk[0][1], blk[1][1], blk[2][1], blk[3][1]];
+      d2[idx] = [blk[0][2], blk[1][2], blk[2][2], blk[3][2]];
+      d3[idx] = [blk[0][3], blk[1][3], blk[2][3], blk[3][3]];
+      d4[idx] = [blk[0][4], blk[1][4], blk[2][4], blk[3][4]];
+      d5[idx] = [blk[0][5], blk[1][5], blk[2][5], blk[3][5]];
+      d6[idx] = [blk[0][6], blk[1][6], blk[2][6], blk[3][6]];
+      d7[idx] = [blk[0][7], blk[1][7], blk[2][7], blk[3][7]];
+    }
+    for (m, &(lo, len)) in spans_tail.iter().enumerate() {
+      let (lo, len) = (lo as usize, len as usize);
+      let ws = &weights[off..off + len];
+      off += len;
+      let mut e = [0f32; 8];
+      for (&w, p) in ws.iter().zip(&power[lo..lo + len]) {
+        for (a, &p) in e.iter_mut().zip(p) {
+          *a = w.mul_add(p, *a);
+        }
+      }
+      t0[m] = e[0];
+      t1[m] = e[1];
+      t2[m] = e[2];
+      t3[m] = e[3];
+      t4[m] = e[4];
+      t5[m] = e[5];
+      t6[m] = e[6];
+      t7[m] = e[7];
+    }
+  } else {
+    for (m, &(lo, len)) in spans.iter().enumerate() {
+      let (lo, len) = (lo as usize, len as usize);
+      let ws = &weights[off..off + len];
+      off += len;
+      let mut e = [0f32; 8];
+      for (&w, p) in ws.iter().zip(&power[lo..lo + len]) {
+        for (a, &p) in e.iter_mut().zip(p) {
+          *a = w.mul_add(p, *a);
+        }
+      }
+      for (l, row) in chunk.chunks_exact_mut(mels).enumerate() {
+        row[m] = e[l];
+      }
+    }
+  }
+}
+
+/// Applies compact sparse `f64` mel filterbank (`weights`, `spans`) to eight `f64` power spectra
+/// `power[bin][frame]`, storing `f32` outputs into `chunk` (`count` rows of `spans.len()` floats).
+pub fn mel_filter8_f64(
+  weights: &[f64],
+  spans: &[(u16, u16)],
+  power: &[[f64; 8]],
+  chunk: &mut [f32],
+  count: usize,
+) {
+  let mels = spans.len();
+  debug_assert!(chunk.len() == count * mels && (1..=8).contains(&count));
+
+  let mut off = 0usize;
+  if count == 8 {
+    let (r0, rest) = chunk.split_at_mut(mels);
+    let (r1, rest) = rest.split_at_mut(mels);
+    let (r2, rest) = rest.split_at_mut(mels);
+    let (r3, rest) = rest.split_at_mut(mels);
+    let (r4, rest) = rest.split_at_mut(mels);
+    let (r5, rest) = rest.split_at_mut(mels);
+    let (r6, r7) = rest.split_at_mut(mels);
+    let (spans4, spans_tail) = spans.as_chunks::<4>();
+    let ((d0, t0), (d1, t1)) = (r0.as_chunks_mut::<4>(), r1.as_chunks_mut::<4>());
+    let ((d2, t2), (d3, t3)) = (r2.as_chunks_mut::<4>(), r3.as_chunks_mut::<4>());
+    let ((d4, t4), (d5, t5)) = (r4.as_chunks_mut::<4>(), r5.as_chunks_mut::<4>());
+    let ((d6, t6), (d7, t7)) = (r6.as_chunks_mut::<4>(), r7.as_chunks_mut::<4>());
+    for (idx, sp) in spans4.iter().enumerate() {
+      let mut blk = [[0f32; 8]; 4];
+      for (slot, &(lo, len)) in blk.iter_mut().zip(sp) {
+        let (lo, len) = (lo as usize, len as usize);
+        let ws = &weights[off..off + len];
+        off += len;
+        let mut s = [0.0f64; 8];
+        for (&w, p) in ws.iter().zip(&power[lo..lo + len]) {
+          for (a, &p) in s.iter_mut().zip(p) {
+            *a = w.mul_add(p, *a);
+          }
+        }
+        for (dst, v) in slot.iter_mut().zip(s) {
+          *dst = v as f32;
+        }
+      }
+      d0[idx] = [blk[0][0], blk[1][0], blk[2][0], blk[3][0]];
+      d1[idx] = [blk[0][1], blk[1][1], blk[2][1], blk[3][1]];
+      d2[idx] = [blk[0][2], blk[1][2], blk[2][2], blk[3][2]];
+      d3[idx] = [blk[0][3], blk[1][3], blk[2][3], blk[3][3]];
+      d4[idx] = [blk[0][4], blk[1][4], blk[2][4], blk[3][4]];
+      d5[idx] = [blk[0][5], blk[1][5], blk[2][5], blk[3][5]];
+      d6[idx] = [blk[0][6], blk[1][6], blk[2][6], blk[3][6]];
+      d7[idx] = [blk[0][7], blk[1][7], blk[2][7], blk[3][7]];
+    }
+    for (m, &(lo, len)) in spans_tail.iter().enumerate() {
+      let (lo, len) = (lo as usize, len as usize);
+      let ws = &weights[off..off + len];
+      off += len;
+      let mut s = [0.0f64; 8];
+      for (&w, p) in ws.iter().zip(&power[lo..lo + len]) {
+        for (a, &p) in s.iter_mut().zip(p) {
+          *a = w.mul_add(p, *a);
+        }
+      }
+      t0[m] = s[0] as f32;
+      t1[m] = s[1] as f32;
+      t2[m] = s[2] as f32;
+      t3[m] = s[3] as f32;
+      t4[m] = s[4] as f32;
+      t5[m] = s[5] as f32;
+      t6[m] = s[6] as f32;
+      t7[m] = s[7] as f32;
+    }
+  } else {
+    for (m, &(lo, len)) in spans.iter().enumerate() {
+      let (lo, len) = (lo as usize, len as usize);
+      let ws = &weights[off..off + len];
+      off += len;
+      let mut s = [0.0f64; 8];
+      for (&w, p) in ws.iter().zip(&power[lo..lo + len]) {
+        for (a, &p) in s.iter_mut().zip(p) {
+          *a = w.mul_add(p, *a);
+        }
+      }
+      for (l, row) in chunk.chunks_exact_mut(mels).enumerate() {
+        row[m] = s[l] as f32;
+      }
+    }
+  }
+}
+
 /// e^x as Cephes' `expf` computes it (relative error ~1e-7) without branches or calls, so loops
 /// of it vectorize: x clamped to the normal range, n = round(x·log₂e) by adding 1.5·2²³, the
 /// remainder by a polynomial, 2ⁿ from the exponent bits.
