@@ -467,6 +467,23 @@ two numbers (A/B/A, warm median unless stated), kept or rejected and why.
 
 ### CPU encoders
 
+- 2026-11-21, all models, Apple M1 (4P + 4E, `aarch64-apple-darwin`, `FEAT_DotProd`):
+  - Split-byte exact 16-bit `sdot` Q8_0 GEMM (`q = hi * 256 + lo`, `hi` in `-127..=127`, `lo` in
+    `-128..=127`, scale `max / 32639`, two `sdot` passes per 32-weight block with `sum_hi << 8`,
+    3×16 sub-tiles with zero register spills, `WAVO_KERNELS=portable` falls back to f32 NEON),
+    plus 4× `kk`-unrolled `vfmaq_laneq_f32` f32 NEON tile, 4×4 transposed `Linear::pack` and
+    `panels`, per-worker persistent thread pool (`p_cores()` for bandwidth-bound `gemv`/`matvecs`
+    and frontends, `threads()` for `gemm`), 128-bit NEON `dot`, full-block `Q8::rows`, Estrin
+    `ops::exp`/`gelu`, 16-lane pairwise `moments`/`softmax`/`attend`, vectorized `rope`/`group_norm`/
+    `im2col`, and benchmark-only macOS P-core QoS (`QOS_CLASS_USER_INTERACTIVE` in `wavo bench`).
+  - Quiet M1 back-to-back A/B against `085e861` (`wavo bench --backend cpu`, warm median ms):
+    `whisper-large-v3-turbo` `jfk` 8938.3 → 4852.3 (1.84×; `WAVO-DOC-2` settled 8574.9 → 4852.3),
+    `gigaam-v3` `ru-short` 557.0 → 268.5 (2.07×), `parakeet-v2` `jfk` 772.4 → 388.7 (1.99×),
+    `parakeet-v3` `jfk` 786.6 → 391.4 (2.01×), `whisper-tiny` `jfk` 267.7 → 172.2 (1.55×),
+    `moonshine-tiny` `jfk` 113.9 → 69.5 (1.64×); ANE `gigaam-v3` `ru-short` 52.2 → 48.6; Metal
+    `whisper-turbo` `jfk` 1927.3 → 1923.8 ms (min 1915.4 → 1909.0). All 63 `make test-all`
+    fixtures exact on `sdot` and portable CPU fixtures exact on `WAVO_KERNELS=portable`. Kept.
+
 N100 (4 Gracemont cores, AVX2 + AVX-VNNI, one 2 MB L2 for all four; 3.0 GHz on one core, 2.4 on
 two, 2.2 on four), `ru-30s.wav` (30 s of Russian), gigaam-v3-e2e-rnnt, `wavo bench --backend cpu`
 warm medians under `taskset`. onnx-asr 0.12 int8 (onnxruntime) on the same cores: warm 6.07 / 5.42 s,

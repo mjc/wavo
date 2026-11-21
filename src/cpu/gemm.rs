@@ -259,6 +259,39 @@ pub fn gemm(a: &[f32], l: &Linear, c: &mut [f32], m: usize, epilogue: Epilogue) 
       },
     );
   }
+  #[cfg(target_arch = "aarch64")]
+  if let Weights::Q8(q8) = &l.w
+    && neon::dotprod()
+  {
+    let (hi, lo, d) = (&mut vec![0i8; m * k], &mut vec![0i8; m * k], &mut vec![0.0; m * k / 32]);
+    let rows = m.div_ceil(4 * super::threads()).max(1);
+    let parts = a[..m * k]
+      .chunks(rows * k)
+      .zip(hi.chunks_mut(rows * k))
+      .zip(lo.chunks_mut(rows * k))
+      .zip(d.chunks_mut(rows * k / 32));
+    par_each(parts, || (), |_, (((a, hi), lo), d)| neon::quantize(a, hi, lo, d));
+    let (ahi, alo, ad) = (&*hi, &*lo, &*d);
+    let (kq, kd) = (k * NR, k / 32 * NR);
+    return jobs(
+      l,
+      c,
+      m,
+      epilogue,
+      kq + 4 * kd,
+      |panels| (vec![0i8; panels * kq], vec![0.0; panels * kd]),
+      |(q, d), i, p| neon::pack(q8, l.n, p, &mut q[i * kq..][..kq], &mut d[i * kd..][..kd]),
+      |(q, d), i, row, last| {
+        let at = |r: usize| (row + r).min(last - 1);
+        let ahi = std::array::from_fn(|r| &ahi[at(r) * k..][..k]);
+        let alo = std::array::from_fn(|r| &alo[at(r) * k..][..k]);
+        let ad = std::array::from_fn(|r| &ad[at(r) * k / 32..][..k / 32]);
+        let (q, d) = (&q[i * kq..][..kq], &d[i * kd..][..kd]);
+        // SAFETY: `neon::dotprod()` checked `is_aarch64_feature_detected!("dotprod")`.
+        unsafe { neon::tile_i16(ahi, alo, ad, q, d, k) }
+      },
+    );
+  }
   let len = m * k;
   let a: Vec<f32> = if len >= 65_536 {
     let mut dst = vec![0.0; len];
@@ -734,8 +767,234 @@ mod x86 {
 #[cfg(target_arch = "aarch64")]
 mod neon {
   use std::arch::aarch64::*;
+  use std::sync::OnceLock;
 
-  use super::{MR, NR};
+  use super::{MR, NR, Q8, to_half};
+
+  /// Whether this ARM64 CPU supports `sdot` (`FEAT_DotProd`), unless `WAVO_KERNELS=portable`
+  /// asks for the f32 NEON tile.
+  pub fn dotprod() -> bool {
+    static DOTPROD: OnceLock<bool> = OnceLock::new();
+    *DOTPROD.get_or_init(|| {
+      std::arch::is_aarch64_feature_detected!("dotprod")
+        && std::env::var_os("WAVO_KERNELS").is_none_or(|v| v != "portable")
+    })
+  }
+
+  /// Rows `x` per 32 values as exact 16-bit signed integers `q = hi * 256 + lo` (`hi` in
+  /// `-127..=127`, `lo` in `-128..=127`) and scale `d = max|x| / 32639`.
+  pub fn quantize(x: &[f32], hi: &mut [i8], lo: &mut [i8], d: &mut [f32]) {
+    // SAFETY: NEON is part of aarch64; every chunk has 32 elements.
+    unsafe {
+      let c128 = vdupq_n_s32(128);
+      for (((x, hi), lo), d) in x
+        .as_chunks::<32>()
+        .0
+        .iter()
+        .zip(hi.as_chunks_mut::<32>().0)
+        .zip(lo.as_chunks_mut::<32>().0)
+        .zip(d)
+      {
+        let mut hx = [0.0f32; 32];
+        for (dst, &v) in hx.iter_mut().zip(x) {
+          *dst = to_half(v);
+        }
+        let xp = hx.as_ptr();
+        let v = [
+          vld1q_f32(xp),
+          vld1q_f32(xp.add(4)),
+          vld1q_f32(xp.add(8)),
+          vld1q_f32(xp.add(12)),
+          vld1q_f32(xp.add(16)),
+          vld1q_f32(xp.add(20)),
+          vld1q_f32(xp.add(24)),
+          vld1q_f32(xp.add(28)),
+        ];
+        let m0 = vmaxq_f32(
+          vmaxq_f32(vabsq_f32(v[0]), vabsq_f32(v[1])),
+          vmaxq_f32(vabsq_f32(v[2]), vabsq_f32(v[3])),
+        );
+        let m1 = vmaxq_f32(
+          vmaxq_f32(vabsq_f32(v[4]), vabsq_f32(v[5])),
+          vmaxq_f32(vabsq_f32(v[6]), vabsq_f32(v[7])),
+        );
+        let max = vmaxvq_f32(vmaxq_f32(m0, m1));
+        *d = max / 32639.0;
+        let inv = if max > 0.0 { 32639.0 / max } else { 0.0 };
+        for half in 0..2 {
+          let mut hs = [vdup_n_s16(0); 4];
+          let mut ls = [vdup_n_s16(0); 4];
+          for j in 0..4 {
+            let q = vcvtnq_s32_f32(vmulq_n_f32(v[half * 4 + j], inv));
+            let h = vshrq_n_s32::<8>(vaddq_s32(q, c128));
+            let l = vsubq_s32(q, vshlq_n_s32::<8>(h));
+            hs[j] = vmovn_s32(h);
+            ls[j] = vmovn_s32(l);
+          }
+          let h8 = vcombine_s8(
+            vmovn_s16(vcombine_s16(hs[0], hs[1])),
+            vmovn_s16(vcombine_s16(hs[2], hs[3])),
+          );
+          let l8 = vcombine_s8(
+            vmovn_s16(vcombine_s16(ls[0], ls[1])),
+            vmovn_s16(vcombine_s16(ls[2], ls[3])),
+          );
+          vst1q_s8(hi.as_mut_ptr().add(half * 16), h8);
+          vst1q_s8(lo.as_mut_ptr().add(half * 16), l8);
+        }
+      }
+    }
+  }
+
+  /// Panel `p` of `w` (`n` rows) for `tile_i16`: values `[k / 4][NR][4]` (four of `k` per lane)
+  /// and scales `[k / 32][NR]`, zeros past the last row.
+  pub fn pack(w: &Q8, n: usize, p: usize, q: &mut [i8], d: &mut [f32]) {
+    let k = w.k;
+    let blocks = k / 32;
+    let base = NR * p;
+    if base + NR <= n {
+      for blk in 0..blocks {
+        let d_out = &mut d[blk * NR..][..NR];
+        let q_out = &mut q[blk * 32 * NR..][..32 * NR];
+        for j in 0..NR {
+          let row = base + j;
+          d_out[j] = w.d[row * blocks + blk];
+          let src = &w.q[row * k + blk * 32..][..32];
+          for (g, src4) in src.as_chunks::<4>().0.iter().enumerate() {
+            q_out[g * 64 + j * 4..][..4].copy_from_slice(src4);
+          }
+        }
+      }
+      return;
+    }
+
+    q.fill(0);
+    d.fill(0.0);
+    for j in 0..NR.min(n.saturating_sub(base)) {
+      let row = base + j;
+      for blk in 0..blocks {
+        d[blk * NR + j] = w.d[row * blocks + blk];
+        let src = &w.q[row * k + blk * 32..][..32];
+        let q_out = &mut q[blk * 32 * NR..][..32 * NR];
+        for (g, src4) in src.as_chunks::<4>().0.iter().enumerate() {
+          q_out[g * 64 + j * 4..][..4].copy_from_slice(src4);
+        }
+      }
+    }
+  }
+
+  #[target_feature(enable = "dotprod")]
+  unsafe fn tile3_i16(
+    ahi: [*const i8; 3],
+    alo: [*const i8; 3],
+    ad: [*const f32; 3],
+    q: *const i8,
+    d: *const f32,
+    blocks: usize,
+  ) -> [[f32; NR]; 3] {
+    macro_rules! sdot {
+      ($acc:expr, $b:expr, $a:expr, $lane:literal) => {{
+        let mut acc = $acc;
+        std::arch::asm!(
+          concat!("sdot {acc:v}.4s, {b:v}.16b, {a:v}.4b[", stringify!($lane), "]"),
+          acc = inout(vreg) acc,
+          b = in(vreg) $b,
+          a = in(vreg_low16) $a,
+          options(pure, nomem, nostack),
+        );
+        acc
+      }};
+    }
+    macro_rules! pass {
+      ($sum:expr, $ap:expr, $qblk:expr, $off:expr) => {
+        for half in 0..2 {
+          let av = [
+            vld1q_s8($ap[0].add($off + half * 16)),
+            vld1q_s8($ap[1].add($off + half * 16)),
+            vld1q_s8($ap[2].add($off + half * 16)),
+          ];
+          macro_rules! lane {
+            ($l:literal) => {
+              let qp = $qblk.add((half * 4 + $l) * 64);
+              let b0 = vld1q_s8(qp);
+              let b1 = vld1q_s8(qp.add(16));
+              let b2 = vld1q_s8(qp.add(32));
+              let b3 = vld1q_s8(qp.add(48));
+              for r in 0..3 {
+                $sum[r][0] = sdot!($sum[r][0], b0, av[r], $l);
+                $sum[r][1] = sdot!($sum[r][1], b1, av[r], $l);
+                $sum[r][2] = sdot!($sum[r][2], b2, av[r], $l);
+                $sum[r][3] = sdot!($sum[r][3], b3, av[r], $l);
+              }
+            };
+          }
+          lane!(0);
+          lane!(1);
+          lane!(2);
+          lane!(3);
+        }
+      };
+    }
+
+    // SAFETY: caller ensures `ahi`, `alo`, `ad`, `q`, `d` cover `blocks` 32-element blocks and
+    // `dotprod` is enabled.
+    unsafe {
+      let mut acc = [[vdupq_n_f32(0.0); 4]; 3];
+      for blk in 0..blocks {
+        let mut sum = [[vdupq_n_s32(0); 4]; 3];
+        let qblk = q.add(blk * 512);
+        let off = blk * 32;
+        pass!(sum, ahi, qblk, off);
+        for row in &mut sum {
+          for v in row {
+            *v = vshlq_n_s32::<8>(*v);
+          }
+        }
+        pass!(sum, alo, qblk, off);
+        let dp = d.add(blk * NR);
+        let dv = [vld1q_f32(dp), vld1q_f32(dp.add(4)), vld1q_f32(dp.add(8)), vld1q_f32(dp.add(12))];
+        for r in 0..3 {
+          let da = vdupq_n_f32(*ad[r].add(blk));
+          for c in 0..4 {
+            acc[r][c] = vfmaq_f32(acc[r][c], vcvtq_f32_s32(sum[r][c]), vmulq_f32(da, dv[c]));
+          }
+        }
+      }
+
+      let mut out = [[0.0; NR]; 3];
+      for (out, acc) in out.iter_mut().zip(acc) {
+        for (i, v) in acc.into_iter().enumerate() {
+          vst1q_f32(out.as_mut_ptr().add(4 * i), v);
+        }
+      }
+      out
+    }
+  }
+
+  /// `MR` rows of `quantize`d `a` (`hi * 256 + lo` with scales `ad`) times a `pack`ed Q8 panel,
+  /// summed exactly in `i32` via `sdot`, then scaled into `f32`.
+  #[target_feature(enable = "dotprod")]
+  pub unsafe fn tile_i16(
+    ahi: [&[i8]; MR],
+    alo: [&[i8]; MR],
+    ad: [&[f32]; MR],
+    q: &[i8],
+    d: &[f32],
+    k: usize,
+  ) -> [[f32; NR]; MR] {
+    let blocks = k / 32;
+    let (q, d) = (&q[..k * NR], &d[..blocks * NR]);
+    let ahi0 = [ahi[0][..k].as_ptr(), ahi[1][..k].as_ptr(), ahi[2][..k].as_ptr()];
+    let alo0 = [alo[0][..k].as_ptr(), alo[1][..k].as_ptr(), alo[2][..k].as_ptr()];
+    let ad0 = [ad[0][..blocks].as_ptr(), ad[1][..blocks].as_ptr(), ad[2][..blocks].as_ptr()];
+    let ahi1 = [ahi[3][..k].as_ptr(), ahi[4][..k].as_ptr(), ahi[5][..k].as_ptr()];
+    let alo1 = [alo[3][..k].as_ptr(), alo[4][..k].as_ptr(), alo[5][..k].as_ptr()];
+    let ad1 = [ad[3][..blocks].as_ptr(), ad[4][..blocks].as_ptr(), ad[5][..blocks].as_ptr()];
+    // SAFETY: slices checked above to cover `blocks` 32-element blocks.
+    let [r0, r1, r2] = unsafe { tile3_i16(ahi0, alo0, ad0, q.as_ptr(), d.as_ptr(), blocks) };
+    let [r3, r4, r5] = unsafe { tile3_i16(ahi1, alo1, ad1, q.as_ptr(), d.as_ptr(), blocks) };
+    [r0, r1, r2, r3, r4, r5]
+  }
 
   pub fn tile(a: [&[f32]; MR], b: &[f32], k: usize) -> [[f32; NR]; MR] {
     let a = [
