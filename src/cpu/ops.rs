@@ -9,9 +9,36 @@ use super::gemm::{NR, panels, product};
 use super::{dot, par_each};
 use crate::gpu::pos_rows;
 
+/// Fused multiply-add when hardware FMA is available (`aarch64` or `+fma`), else `a * b + c`
+/// so baseline `x86_64` autovectorizes to SSE2 instead of calling scalar `fmaf@PLT`.
+#[inline(always)]
+pub(crate) fn fma(a: f32, b: f32, c: f32) -> f32 {
+  #[cfg(any(target_arch = "aarch64", target_feature = "fma"))]
+  {
+    a.mul_add(b, c)
+  }
+  #[cfg(not(any(target_arch = "aarch64", target_feature = "fma")))]
+  {
+    a * b + c
+  }
+}
+
+/// `f64` companion to [`fma`], avoiding scalar `fma@PLT` on baseline `x86_64`.
+#[inline(always)]
+pub(crate) fn fma64(a: f64, b: f64, c: f64) -> f64 {
+  #[cfg(any(target_arch = "aarch64", target_feature = "fma"))]
+  {
+    a.mul_add(b, c)
+  }
+  #[cfg(not(any(target_arch = "aarch64", target_feature = "fma")))]
+  {
+    a * b + c
+  }
+}
+
 /// `ln(x)` for positive normal `x` (`>= 1e-10`) as Cephes' `logf` computes it (error <= 2 ULP),
-/// without branches or calls so loops of it autovectorize to NEON / AVX2. Uses Estrin's scheme
-/// to halve the FMA dependency chain depth.
+/// without branches or calls so loops of it autovectorize to NEON / SSE2 / AVX2. Uses Estrin's
+/// scheme to halve the dependency chain depth.
 #[inline(always)]
 pub fn ln(x: f32) -> f32 {
   const SQRT_HALF: u32 = 0x3f35_04f3;
@@ -21,16 +48,16 @@ pub fn ln(x: f32) -> f32 {
   let f = m - 1.0;
   let f2 = f * f;
   let f4 = f2 * f2;
-  let p01 = (-2.499_999_4e-1f32).mul_add(f, 3.333_333e-1);
-  let p23 = (-1.666_805_7e-1f32).mul_add(f, 2.000_071_5e-1);
-  let p45 = (-1.242_014_1e-1f32).mul_add(f, 1.424_932_3e-1);
-  let p67 = (-1.151_461e-1f32).mul_add(f, 1.167_699_9e-1);
-  let p03 = p23.mul_add(f2, p01);
-  let p47 = p67.mul_add(f2, p45);
-  let p48 = 7.037_683_6e-2f32.mul_add(f4, p47);
-  let p = p48.mul_add(f4, p03);
-  let poly = (p * f).mul_add(f2, (-0.5f32).mul_add(f2, f));
-  e.mul_add(0.693_359_4, e.mul_add(-2.121_944_4e-4, poly))
+  let p01 = fma(-2.499_999_4e-1, f, 3.333_333e-1);
+  let p23 = fma(-1.666_805_7e-1, f, 2.000_071_5e-1);
+  let p45 = fma(-1.242_014_1e-1, f, 1.424_932_3e-1);
+  let p67 = fma(-1.151_461e-1, f, 1.167_699_9e-1);
+  let p03 = fma(p23, f2, p01);
+  let p47 = fma(p67, f2, p45);
+  let p48 = fma(7.037_683_6e-2, f4, p47);
+  let p = fma(p48, f4, p03);
+  let poly = fma(p * f, f2, fma(-0.5, f2, f));
+  fma(e, 0.693_359_4, fma(e, -2.121_944_4e-4, poly))
 }
 
 /// Applies `ln(x.clamp(lo, hi))` in place in 16-wide chunks so NEON constants stay in registers.
@@ -127,7 +154,7 @@ pub fn mel_filter8_f32(
         let mut e = [0f32; 8];
         for (&w, p) in ws.iter().zip(&power[lo..lo + len]) {
           for (a, &p) in e.iter_mut().zip(p) {
-            *a = w.mul_add(p, *a);
+            *a = fma(w, p, *a);
           }
         }
         *slot = e;
@@ -148,7 +175,7 @@ pub fn mel_filter8_f32(
       let mut e = [0f32; 8];
       for (&w, p) in ws.iter().zip(&power[lo..lo + len]) {
         for (a, &p) in e.iter_mut().zip(p) {
-          *a = w.mul_add(p, *a);
+          *a = fma(w, p, *a);
         }
       }
       t0[m] = e[0];
@@ -168,7 +195,7 @@ pub fn mel_filter8_f32(
       let mut e = [0f32; 8];
       for (&w, p) in ws.iter().zip(&power[lo..lo + len]) {
         for (a, &p) in e.iter_mut().zip(p) {
-          *a = w.mul_add(p, *a);
+          *a = fma(w, p, *a);
         }
       }
       for (l, row) in chunk.chunks_exact_mut(mels).enumerate() {
@@ -213,7 +240,7 @@ pub fn mel_filter8_f64(
         let mut s = [0.0f64; 8];
         for (&w, p) in ws.iter().zip(&power[lo..lo + len]) {
           for (a, &p) in s.iter_mut().zip(p) {
-            *a = w.mul_add(p, *a);
+            *a = fma64(w, p, *a);
           }
         }
         for (dst, v) in slot.iter_mut().zip(s) {
@@ -236,7 +263,7 @@ pub fn mel_filter8_f64(
       let mut s = [0.0f64; 8];
       for (&w, p) in ws.iter().zip(&power[lo..lo + len]) {
         for (a, &p) in s.iter_mut().zip(p) {
-          *a = w.mul_add(p, *a);
+          *a = fma64(w, p, *a);
         }
       }
       t0[m] = s[0] as f32;
@@ -256,7 +283,7 @@ pub fn mel_filter8_f64(
       let mut s = [0.0f64; 8];
       for (&w, p) in ws.iter().zip(&power[lo..lo + len]) {
         for (a, &p) in s.iter_mut().zip(p) {
-          *a = w.mul_add(p, *a);
+          *a = fma64(w, p, *a);
         }
       }
       for (l, row) in chunk.chunks_exact_mut(mels).enumerate() {
@@ -267,19 +294,19 @@ pub fn mel_filter8_f64(
 }
 
 /// e^x as Cephes' `expf` computes it (relative error ~1e-7) without branches or calls, using
-/// Estrin's scheme with `mul_add` so loops autovectorize to low-latency NEON / AVX2 FMAs.
+/// Estrin's scheme so loops autovectorize cleanly on NEON and SSE2/AVX2.
 #[inline(always)]
 pub fn exp(x: f32) -> f32 {
   const MAGIC: f32 = 12_582_912.0;
   let x = x.clamp(-87.0, 88.0);
-  let t = x.mul_add(std::f32::consts::LOG2_E, MAGIC);
+  let t = fma(x, std::f32::consts::LOG2_E, MAGIC);
   let n = t - MAGIC;
-  let r = n.mul_add(2.121_944_4e-4, n.mul_add(-0.693_359_4, x));
+  let r = fma(n, 2.121_944_4e-4, fma(n, -0.693_359_4, x));
   let r2 = r * r;
-  let p01 = 0.166_666_65f32.mul_add(r, 0.5);
-  let p23 = 8.333_452e-3f32.mul_add(r, 4.166_579_6e-2);
-  let p45 = 1.987_569_1e-4f32.mul_add(r, 1.398_199_9e-3);
-  let p = p45.mul_add(r2, p23).mul_add(r2, p01).mul_add(r2, r) + 1.0;
+  let p01 = fma(0.166_666_65, r, 0.5);
+  let p23 = fma(8.333_452e-3, r, 4.166_579_6e-2);
+  let p45 = fma(1.987_569_1e-4, r, 1.398_199_9e-3);
+  let p = fma(fma(fma(p45, r2, p23), r2, p01), r2, r) + 1.0;
   let scale = f32::from_bits(((t.to_bits() as i32 - 0x4B40_0000 + 127) << 23) as u32);
   p * scale
 }
@@ -293,11 +320,11 @@ pub fn silu(x: f32) -> f32 {
 #[inline(always)]
 pub fn gelu(x: f32) -> f32 {
   let z = (std::f32::consts::FRAC_1_SQRT_2 * x).abs();
-  let t = 1.0 / 0.327_591_1f32.mul_add(z, 1.0);
+  let t = 1.0 / fma(0.327_591_1, z, 1.0);
   let t2 = t * t;
-  let p01 = (-0.284_496_74f32).mul_add(t, 0.254_829_6);
-  let p23 = (-1.453_152f32).mul_add(t, 1.421_413_8);
-  let p = 1.061_405_4f32.mul_add(t2, p23).mul_add(t2, p01);
+  let p01 = fma(-0.284_496_74, t, 0.254_829_6);
+  let p23 = fma(-1.453_152, t, 1.421_413_8);
+  let p = fma(fma(1.061_405_4, t2, p23), t2, p01);
   let s = 1.0f32.copysign(x);
   0.5 * x * (1.0 + s * (1.0 - p * t * exp(-z * z)))
 }
@@ -327,13 +354,13 @@ fn moments(x: &[f32]) -> (f32, f32) {
   for c in chunks {
     for (s, &v) in acc.iter_mut().zip(c) {
       let d = v - mean;
-      *s = d.mul_add(d, *s);
+      *s = fma(d, d, *s);
     }
   }
   let mut var = reduce16(acc);
   for &v in tail {
     let d = v - mean;
-    var = d.mul_add(d, var);
+    var = fma(d, d, var);
   }
   (mean, 1.0 / (var / n + 1e-5).sqrt())
 }
@@ -489,7 +516,7 @@ pub fn conv_glu(
           // Source frame plus the padding.
           let Some(src) = (i + k).checked_sub(kernel / 2).filter(|&s| s < t) else { continue };
           for ((a, w), x) in acc.iter_mut().zip(taps).zip(&h[src * 2 * ch..][..ch]) {
-            *a = w.mul_add(*x, *a);
+            *a = fma(*w, *x, *a);
           }
         }
 
@@ -620,14 +647,14 @@ fn softmax(scores: &mut [f32], m: usize, t: usize, scale: f32) {
     let mut sum16 = [0.0f32; 16];
     for c in chunks {
       for (s, x) in sum16.iter_mut().zip(c.iter_mut()) {
-        let e = exp((*x).mul_add(scale, -max));
+        let e = exp(fma(*x, scale, -max));
         *x = e;
         *s += e;
       }
     }
     let mut total = reduce16(sum16);
     for x in tail {
-      let e = exp((*x).mul_add(scale, -max));
+      let e = exp(fma(*x, scale, -max));
       *x = e;
       total += e;
     }
@@ -695,7 +722,7 @@ pub fn attend(q: &[f32], kv: &[f32], cols: usize, n: usize, o: &mut [f32], heads
         o.fill(0.0);
         for (&s, v) in s.iter().zip(v.chunks_exact(hd)) {
           for (o, &v) in o.iter_mut().zip(v) {
-            *o = s.mul_add(v, *o);
+            *o = fma(s, v, *o);
           }
         }
 
@@ -754,14 +781,14 @@ pub fn group_norm(x: &mut [f32], (w, b): (&[f32], &[f32]), eps: f32) {
   for c in chunks {
     for (s, &v) in var8.iter_mut().zip(c) {
       let d = v as f64 - mean;
-      *s = d.mul_add(d, *s);
+      *s = fma64(d, d, *s);
     }
   }
   let mut var =
     ((var8[0] + var8[4]) + (var8[2] + var8[6])) + ((var8[1] + var8[5]) + (var8[3] + var8[7]));
   for &v in tail {
     let d = v as f64 - mean;
-    var = d.mul_add(d, var);
+    var = fma64(d, d, var);
   }
   let (mean, rstd) = (mean as f32, 1.0 / ((var / n) as f32 + eps).sqrt());
   for row in x.chunks_exact_mut(w.len()) {
