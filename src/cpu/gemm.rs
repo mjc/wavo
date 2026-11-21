@@ -84,12 +84,112 @@ impl Linear {
     }
   }
 
-  /// Panel `p` into `out` `[k][NR]`: rows 16p.. of W, zeros past the last; `wide` is scratch of
-  /// `k` floats.
-  fn pack(&self, p: usize, out: &mut [f32], wide: &mut [f32]) {
+  /// Panel `p` into `out` `[k][NR]`: rows 16p.. of W, zeros past the last.
+  fn pack(&self, p: usize, out: &mut [f32]) {
     let k = self.k;
+    let base = NR * p;
+    if base + NR <= self.n {
+      match &self.w {
+        Weights::Q8(q8) => {
+          let blocks = k / 32;
+          for (blk, out_blk) in out.as_chunks_mut::<{ 32 * NR }>().0.iter_mut().enumerate() {
+            for g in 0..4 {
+              let r0 = base + 4 * g;
+              let mut tmp = [[0.0f32; 32]; 4];
+              for (r, dst_row) in tmp.iter_mut().enumerate() {
+                let row = r0 + r;
+                let d = q8.d[row * blocks + blk];
+                let qs = &q8.q[row * k + blk * 32..][..32];
+                for (dst, &q) in dst_row.iter_mut().zip(qs) {
+                  *dst = to_half(q as f32 * d);
+                }
+              }
+              for b4 in (0..32).step_by(4) {
+                let r0 = [tmp[0][b4], tmp[0][b4 + 1], tmp[0][b4 + 2], tmp[0][b4 + 3]];
+                let r1 = [tmp[1][b4], tmp[1][b4 + 1], tmp[1][b4 + 2], tmp[1][b4 + 3]];
+                let r2 = [tmp[2][b4], tmp[2][b4 + 1], tmp[2][b4 + 2], tmp[2][b4 + 3]];
+                let r3 = [tmp[3][b4], tmp[3][b4 + 1], tmp[3][b4 + 2], tmp[3][b4 + 3]];
+                for t in 0..4 {
+                  out_blk[(b4 + t) * NR + 4 * g..][..4]
+                    .copy_from_slice(&[r0[t], r1[t], r2[t], r3[t]]);
+                }
+              }
+            }
+          }
+          return;
+        }
+        Weights::F16(w) => {
+          let blocks = k / 32;
+          for (blk, out_blk) in out.as_chunks_mut::<{ 32 * NR }>().0.iter_mut().enumerate() {
+            for g in 0..4 {
+              let r0 = base + 4 * g;
+              let mut tmp = [[0.0f32; 32]; 4];
+              for (r, dst_row) in tmp.iter_mut().enumerate() {
+                w[(r0 + r) * k + blk * 32..][..32].convert_to_f32_slice(dst_row);
+              }
+              for b4 in (0..32).step_by(4) {
+                let r0 = [tmp[0][b4], tmp[0][b4 + 1], tmp[0][b4 + 2], tmp[0][b4 + 3]];
+                let r1 = [tmp[1][b4], tmp[1][b4 + 1], tmp[1][b4 + 2], tmp[1][b4 + 3]];
+                let r2 = [tmp[2][b4], tmp[2][b4 + 1], tmp[2][b4 + 2], tmp[2][b4 + 3]];
+                let r3 = [tmp[3][b4], tmp[3][b4 + 1], tmp[3][b4 + 2], tmp[3][b4 + 3]];
+                for t in 0..4 {
+                  out_blk[(b4 + t) * NR + 4 * g..][..4]
+                    .copy_from_slice(&[r0[t], r1[t], r2[t], r3[t]]);
+                }
+              }
+            }
+          }
+          let rem = blocks * 32;
+          if rem < k {
+            for j in 0..NR {
+              let row = base + j;
+              for kk in rem..k {
+                out[kk * NR + j] = w[row * k + kk].to_f32();
+              }
+            }
+          }
+          return;
+        }
+        Weights::F32(w) => {
+          let blocks = k / 32;
+          for (blk, out_blk) in out.as_chunks_mut::<{ 32 * NR }>().0.iter_mut().enumerate() {
+            for g in 0..4 {
+              let r0 = base + 4 * g;
+              let mut tmp = [[0.0f32; 32]; 4];
+              for (r, dst_row) in tmp.iter_mut().enumerate() {
+                let src = &w[(r0 + r) * k + blk * 32..][..32];
+                for (dst, &v) in dst_row.iter_mut().zip(src) {
+                  *dst = to_half(v);
+                }
+              }
+              for b4 in (0..32).step_by(4) {
+                let r0 = [tmp[0][b4], tmp[0][b4 + 1], tmp[0][b4 + 2], tmp[0][b4 + 3]];
+                let r1 = [tmp[1][b4], tmp[1][b4 + 1], tmp[1][b4 + 2], tmp[1][b4 + 3]];
+                let r2 = [tmp[2][b4], tmp[2][b4 + 1], tmp[2][b4 + 2], tmp[2][b4 + 3]];
+                let r3 = [tmp[3][b4], tmp[3][b4 + 1], tmp[3][b4 + 2], tmp[3][b4 + 3]];
+                for t in 0..4 {
+                  out_blk[(b4 + t) * NR + 4 * g..][..4]
+                    .copy_from_slice(&[r0[t], r1[t], r2[t], r3[t]]);
+                }
+              }
+            }
+          }
+          let rem = blocks * 32;
+          if rem < k {
+            for j in 0..NR {
+              let row = base + j;
+              for kk in rem..k {
+                out[kk * NR + j] = to_half(w[row * k + kk]);
+              }
+            }
+          }
+          return;
+        }
+      }
+    }
+
     for j in 0..NR {
-      let row = NR * p + j;
+      let row = base + j;
       if row >= self.n {
         out.iter_mut().skip(j).step_by(NR).for_each(|v| *v = 0.0);
         continue;
@@ -107,9 +207,8 @@ impl Linear {
           }
         }
         Weights::F16(w) => {
-          w[row * k..][..k].convert_to_f32_slice(wide);
-          for (w, out) in wide.iter().zip(out.as_chunks_mut::<NR>().0) {
-            out[j] = *w;
+          for (w, out) in w[row * k..][..k].iter().zip(out.as_chunks_mut::<NR>().0) {
+            out[j] = w.to_f32();
           }
         }
         Weights::F32(w) => {
@@ -160,7 +259,23 @@ pub fn gemm(a: &[f32], l: &Linear, c: &mut [f32], m: usize, epilogue: Epilogue) 
       },
     );
   }
-  let a: Vec<f32> = a[..m * k].iter().map(|&x| to_half(x)).collect();
+  let len = m * k;
+  let a: Vec<f32> = if len >= 65_536 {
+    let mut dst = vec![0.0; len];
+    let chunk = len.div_ceil(super::threads()).max(16_384);
+    par_each(
+      dst.chunks_mut(chunk).zip(a[..len].chunks(chunk)),
+      || (),
+      |_, (dst, src)| {
+        for (d, &x) in dst.iter_mut().zip(src) {
+          *d = to_half(x);
+        }
+      },
+    );
+    dst
+  } else {
+    a[..len].iter().map(|&x| to_half(x)).collect()
+  };
   let kb = k * NR;
   jobs(
     l,
@@ -168,9 +283,9 @@ pub fn gemm(a: &[f32], l: &Linear, c: &mut [f32], m: usize, epilogue: Epilogue) 
     m,
     epilogue,
     4 * kb,
-    |panels| (vec![0.0; panels * kb], vec![0.0; k]),
-    |(b, wide), i, p| l.pack(p, &mut b[i * kb..][..kb], wide),
-    |(b, _), i, row, last| {
+    |panels| vec![0.0; panels * kb],
+    |b, i, p| l.pack(p, &mut b[i * kb..][..kb]),
+    |b, i, row, last| {
       tile(std::array::from_fn(|r| &a[(row + r).min(last - 1) * k..][..k]), &b[i * kb..][..kb], k)
     },
   );
@@ -215,11 +330,8 @@ pub fn gemv(x: &[f32], l: &Linear, c: &mut [f32], epilogue: Epilogue) {
 fn to_half(x: f32) -> f32 {
   let b = x.to_bits();
   let normal = f32::from_bits((b + 0xfff + ((b >> 13) & 1)) & 0xffff_e000);
-  if x.abs() < f32::from_bits(0x3880_0000) {
-    (x * 16_777_216.0).round_ties_even() / 16_777_216.0
-  } else {
-    normal
-  }
+  let sub = (x * 16_777_216.0).round_ties_even() * (1.0 / 16_777_216.0);
+  if x.abs() < f32::from_bits(0x3880_0000) { sub } else { normal }
 }
 
 /// Runs a GEMM's jobs over `l`'s panels of `bytes` each: a job packs a group of panels that fits
@@ -239,7 +351,7 @@ fn jobs<S>(
 ) {
   let n = l.n;
   let panels = n.div_ceil(NR);
-  let per_group = (GROUP / bytes).clamp(1, panels);
+  let per_group = (GROUP / bytes).min(panels.div_ceil(4 * super::threads())).clamp(1, panels);
   let groups = panels.div_ceil(per_group);
   // Enough jobs to keep the threads busy to the end, each over at least 8 tiles of rows.
   let splits = (4 * super::threads()).div_ceil(groups).min(m.div_ceil(8 * MR)).max(1);
@@ -274,11 +386,45 @@ fn jobs<S>(
 /// `[k][n]`, for `product`: zeros past n, and past the rows of `b` up to `k`.
 pub fn panels(b: &[f32], ld: usize, n: usize, k: usize, rows: usize, transposed: bool) -> Vec<f32> {
   let mut out = vec![0.0; n.div_ceil(NR) * k * NR];
+  if transposed {
+    for (p, out) in out.chunks_exact_mut(k * NR).enumerate() {
+      let col0 = NR * p;
+      let w = NR.min(n - col0);
+      for (kk, dst) in out.as_chunks_mut::<NR>().0.iter_mut().take(rows).enumerate() {
+        dst[..w].copy_from_slice(&b[kk * ld + col0..][..w]);
+      }
+    }
+    return out;
+  }
+
   for (p, out) in out.chunks_exact_mut(k * NR).enumerate() {
-    for j in 0..NR.min(n - NR * p) {
-      for (kk, out) in out.as_chunks_mut::<NR>().0.iter_mut().take(rows).enumerate() {
-        let col = NR * p + j;
-        out[j] = if transposed { b[kk * ld + col] } else { b[col * ld + kk] };
+    let col0 = NR * p;
+    let w = NR.min(n - col0);
+    let g4 = w / 4;
+    let rows4 = rows / 4 * 4;
+    for g in 0..g4 {
+      let r0 = col0 + 4 * g;
+      let s0 = &b[r0 * ld..][..rows];
+      let s1 = &b[(r0 + 1) * ld..][..rows];
+      let s2 = &b[(r0 + 2) * ld..][..rows];
+      let s3 = &b[(r0 + 3) * ld..][..rows];
+      for kk in (0..rows4).step_by(4) {
+        let a0 = [s0[kk], s0[kk + 1], s0[kk + 2], s0[kk + 3]];
+        let a1 = [s1[kk], s1[kk + 1], s1[kk + 2], s1[kk + 3]];
+        let a2 = [s2[kk], s2[kk + 1], s2[kk + 2], s2[kk + 3]];
+        let a3 = [s3[kk], s3[kk + 1], s3[kk + 2], s3[kk + 3]];
+        for t in 0..4 {
+          out[(kk + t) * NR + 4 * g..][..4].copy_from_slice(&[a0[t], a1[t], a2[t], a3[t]]);
+        }
+      }
+      for kk in rows4..rows {
+        out[kk * NR + 4 * g..][..4].copy_from_slice(&[s0[kk], s1[kk], s2[kk], s3[kk]]);
+      }
+    }
+    for j in g4 * 4..w {
+      let src = &b[(col0 + j) * ld..][..rows];
+      for (kk, &v) in src.iter().enumerate() {
+        out[kk * NR + j] = v;
       }
     }
   }
@@ -329,11 +475,65 @@ impl Out {
     bias: &[f32],
     epilogue: Epilogue,
   ) {
+    let w = cols.len();
+    if w == NR {
+      let bias: &[f32; NR] = bias[..NR].try_into().unwrap();
+      for (r, acc) in rows.zip(acc) {
+        // SAFETY: as the caller promises, `cols.len() == NR`.
+        let c: &mut [f32; NR] =
+          unsafe { &mut *self.0.add(r * ld + cols.start).cast::<[f32; NR]>() };
+        finish_nr(c, acc, bias, epilogue);
+      }
+      return;
+    }
     for (r, acc) in rows.zip(acc) {
       // SAFETY: as the caller promises.
-      let c =
-        unsafe { std::slice::from_raw_parts_mut(self.0.add(r * ld + cols.start), cols.len()) };
-      finish(c, &acc[..cols.len()], bias, epilogue);
+      let c = unsafe { std::slice::from_raw_parts_mut(self.0.add(r * ld + cols.start), w) };
+      finish(c, &acc[..w], bias, epilogue);
+    }
+  }
+}
+
+/// Compile-time `NR`-wide specialization of `finish` so every full GEMM tile vectorizes to four
+/// 4-wide NEON ops per row with no dynamic loop or scalar tail.
+#[inline]
+fn finish_nr(c: &mut [f32; NR], acc: &[f32; NR], bias: &[f32; NR], epilogue: Epilogue) {
+  match epilogue {
+    Epilogue::Bias => {
+      for i in 0..NR {
+        c[i] = acc[i] + bias[i];
+      }
+    }
+    Epilogue::Silu => {
+      for i in 0..NR {
+        c[i] = ops::silu(acc[i] + bias[i]);
+      }
+    }
+    Epilogue::Relu => {
+      for i in 0..NR {
+        c[i] = (acc[i] + bias[i]).max(0.0);
+      }
+    }
+    Epilogue::Residual(alpha) => {
+      for i in 0..NR {
+        c[i] = alpha.mul_add(acc[i] + bias[i], c[i]);
+      }
+    }
+    Epilogue::Gelu => {
+      for i in 0..NR {
+        c[i] = ops::gelu(acc[i] + bias[i]);
+      }
+    }
+    Epilogue::GeluResidual => {
+      for i in 0..NR {
+        c[i] += ops::gelu(acc[i] + bias[i]);
+      }
+    }
+    // As the GPU's: tanh(±10) is ±1 in f32.
+    Epilogue::Tanh => {
+      for i in 0..NR {
+        c[i] = (acc[i] + bias[i]).clamp(-10.0, 10.0).tanh();
+      }
     }
   }
 }
@@ -538,12 +738,54 @@ mod neon {
   use super::{MR, NR};
 
   pub fn tile(a: [&[f32]; MR], b: &[f32], k: usize) -> [[f32; NR]; MR] {
-    let (a, b) = (a.map(|a| a[..k].as_ptr()), &b[..k * NR]);
-    // SAFETY: NEON is part of aarch64; the loads read 16 floats of row kk of the panel and element
-    // kk of each row of `a`.
+    let a = [
+      a[0][..k].as_ptr(),
+      a[1][..k].as_ptr(),
+      a[2][..k].as_ptr(),
+      a[3][..k].as_ptr(),
+      a[4][..k].as_ptr(),
+      a[5][..k].as_ptr(),
+    ];
+    let b = &b[..k * NR];
+    // SAFETY: NEON is part of aarch64; the loads read 16 floats per k-row of `b` and up to 4
+    // contiguous floats of each row of `a` below `k`.
     unsafe {
       let mut acc = [[vdupq_n_f32(0.0); 4]; MR];
-      for kk in 0..k {
+      let k4 = k / 4 * 4;
+      let mut kk = 0;
+      while kk < k4 {
+        let av = [
+          vld1q_f32(a[0].add(kk)),
+          vld1q_f32(a[1].add(kk)),
+          vld1q_f32(a[2].add(kk)),
+          vld1q_f32(a[3].add(kk)),
+          vld1q_f32(a[4].add(kk)),
+          vld1q_f32(a[5].add(kk)),
+        ];
+        macro_rules! step {
+          ($lane:literal) => {
+            let p = b.as_ptr().add((kk + $lane) * NR);
+            let b0 = vld1q_f32(p);
+            let b1 = vld1q_f32(p.add(4));
+            for r in 0..MR {
+              acc[r][0] = vfmaq_laneq_f32::<$lane>(acc[r][0], b0, av[r]);
+              acc[r][1] = vfmaq_laneq_f32::<$lane>(acc[r][1], b1, av[r]);
+            }
+            let b2 = vld1q_f32(p.add(8));
+            let b3 = vld1q_f32(p.add(12));
+            for r in 0..MR {
+              acc[r][2] = vfmaq_laneq_f32::<$lane>(acc[r][2], b2, av[r]);
+              acc[r][3] = vfmaq_laneq_f32::<$lane>(acc[r][3], b3, av[r]);
+            }
+          };
+        }
+        step!(0);
+        step!(1);
+        step!(2);
+        step!(3);
+        kk += 4;
+      }
+      while kk < k {
         let p = b.as_ptr().add(kk * NR);
         let bv = [vld1q_f32(p), vld1q_f32(p.add(4)), vld1q_f32(p.add(8)), vld1q_f32(p.add(12))];
         for (acc, a) in acc.iter_mut().zip(a) {
@@ -552,6 +794,7 @@ mod neon {
             *c = vfmaq_f32(*c, b, v);
           }
         }
+        kk += 1;
       }
 
       let mut out = [[0.0; NR]; MR];
