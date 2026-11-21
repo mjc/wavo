@@ -266,34 +266,40 @@ pub fn mel_filter8_f64(
   }
 }
 
-/// e^x as Cephes' `expf` computes it (relative error ~1e-7) without branches or calls, so loops
-/// of it vectorize: x clamped to the normal range, n = round(x·log₂e) by adding 1.5·2²³, the
-/// remainder by a polynomial, 2ⁿ from the exponent bits.
-#[inline]
+/// e^x as Cephes' `expf` computes it (relative error ~1e-7) without branches or calls, using
+/// Estrin's scheme with `mul_add` so loops autovectorize to low-latency NEON / AVX2 FMAs.
+#[inline(always)]
 pub fn exp(x: f32) -> f32 {
-  const MAGIC: f32 = 12582912.0;
+  const MAGIC: f32 = 12_582_912.0;
   let x = x.clamp(-87.0, 88.0);
-  let t = x * std::f32::consts::LOG2_E + MAGIC;
+  let t = x.mul_add(std::f32::consts::LOG2_E, MAGIC);
   let n = t - MAGIC;
-  let r = x - n * 0.693_359_4 + n * 2.121_944_4e-4;
-  let p = 1.987_569_1e-4 * r + 1.398_199_9e-3;
-  let p = ((((p * r + 8.333_452e-3) * r + 4.166_579_6e-2) * r + 0.166_666_65) * r + 0.5) * r * r;
+  let r = n.mul_add(2.121_944_4e-4, n.mul_add(-0.693_359_4, x));
+  let r2 = r * r;
+  let p01 = 0.166_666_65f32.mul_add(r, 0.5);
+  let p23 = 8.333_452e-3f32.mul_add(r, 4.166_579_6e-2);
+  let p45 = 1.987_569_1e-4f32.mul_add(r, 1.398_199_9e-3);
+  let p = p45.mul_add(r2, p23).mul_add(r2, p01).mul_add(r2, r) + 1.0;
   let scale = f32::from_bits(((t.to_bits() as i32 - 0x4B40_0000 + 127) << 23) as u32);
-  (p + r + 1.0) * scale
+  p * scale
 }
 
-#[inline]
+#[inline(always)]
 pub fn silu(x: f32) -> f32 {
   x / (1.0 + exp(-x))
 }
 
 /// GELU with erf as the GPU's `gelu` computes it: Abramowitz–Stegun 7.1.26, as ggml-metal.
-#[inline]
+#[inline(always)]
 pub fn gelu(x: f32) -> f32 {
   let z = (std::f32::consts::FRAC_1_SQRT_2 * x).abs();
-  let t = 1.0 / (1.0 + 0.327_591_1 * z);
-  let p = (((1.061_405_4 * t - 1.453_152) * t + 1.421_413_8) * t - 0.284_496_74) * t + 0.254_829_6;
-  0.5 * x * (1.0 + x.signum() * (1.0 - p * t * exp(-z * z)))
+  let t = 1.0 / 0.327_591_1f32.mul_add(z, 1.0);
+  let t2 = t * t;
+  let p01 = (-0.284_496_74f32).mul_add(t, 0.254_829_6);
+  let p23 = (-1.453_152f32).mul_add(t, 1.421_413_8);
+  let p = 1.061_405_4f32.mul_add(t2, p23).mul_add(t2, p01);
+  let s = 1.0f32.copysign(x);
+  0.5 * x * (1.0 + s * (1.0 - p * t * exp(-z * z)))
 }
 
 /// Rows per job for `rows` rows: about four jobs per thread.
@@ -301,22 +307,48 @@ fn chunk(rows: usize) -> usize {
   rows.div_ceil(4 * super::threads()).max(1)
 }
 
-/// Mean and 1/√(variance + 1e-5) of a row.
-fn moments(x: &[f32]) -> (f32, f32) {
-  let n = x.len() as f32;
-  let mean = sum(x.iter().copied()) / n;
-  let var = sum(x.iter().map(|v| (v - mean) * (v - mean))) / n;
-  (mean, 1.0 / (var + 1e-5).sqrt())
+/// Pairwise reduction of 16 lanes in 4-float vectors so LLVM emits full 128-bit
+/// `fadd.4s`/`fmla.4s`.
+#[inline]
+fn reduce16(acc: [f32; 16]) -> f32 {
+  let mut s = [0.0f32; 4];
+  for i in 0..4 {
+    s[i] = (acc[i] + acc[i + 4]) + (acc[i + 8] + acc[i + 12]);
+  }
+  s[0] + s[1] + s[2] + s[3]
 }
 
-/// A sum in 8 lanes, which vectorizes.
-fn sum(v: impl Iterator<Item = f32>) -> f32 {
-  let mut acc = [0.0; 8];
-  for (i, v) in v.enumerate() {
-    acc[i % 8] += v;
+/// Mean and 1/√(variance + 1e-5) of a row, vectorized in 16-float chunks.
+fn moments(x: &[f32]) -> (f32, f32) {
+  let n = x.len() as f32;
+  let mean = sum_slice(x) / n;
+  let (chunks, tail) = x.as_chunks::<16>();
+  let mut acc = [0.0f32; 16];
+  for c in chunks {
+    for (s, &v) in acc.iter_mut().zip(c) {
+      let d = v - mean;
+      *s = d.mul_add(d, *s);
+    }
   }
+  let mut var = reduce16(acc);
+  for &v in tail {
+    let d = v - mean;
+    var = d.mul_add(d, var);
+  }
+  (mean, 1.0 / (var / n + 1e-5).sqrt())
+}
 
-  acc.iter().sum()
+/// A sum of a slice in 16 lanes (four NEON vectors), which autovectorizes cleanly.
+#[inline]
+fn sum_slice(x: &[f32]) -> f32 {
+  let (chunks, tail) = x.as_chunks::<16>();
+  let mut acc = [0.0f32; 16];
+  for c in chunks {
+    for (s, &v) in acc.iter_mut().zip(c) {
+      *s += v;
+    }
+  }
+  reduce16(acc) + tail.iter().sum::<f32>()
 }
 
 /// LayerNorm (eps 1e-5) of the rows of `x` into `y`, both `[rows][w.len()]`; with `rope` (a table
@@ -371,6 +403,38 @@ pub fn layer_norm(
 pub fn im2col(x: &[f32], t: usize, ch: usize, [kernel, stride, pad]: [usize; 3]) -> Vec<f32> {
   let rows = (t + 2 * pad - kernel) / stride + 1;
   let mut col = vec![0.0; rows * ch * kernel];
+  if ch == 1 && pad == 0 {
+    for (i, dst) in col.chunks_exact_mut(kernel).enumerate() {
+      dst.copy_from_slice(&x[stride * i..][..kernel]);
+    }
+    return col;
+  }
+  if kernel == 3 {
+    for (i, col) in col.chunks_exact_mut(ch * 3).enumerate() {
+      let s0 = stride * i;
+      if s0 >= pad && s0 - pad + 3 <= t {
+        let base = (s0 - pad) * ch;
+        let (r0, r1, r2) =
+          (&x[base..base + ch], &x[base + ch..base + 2 * ch], &x[base + 2 * ch..base + 3 * ch]);
+        for (dst, ((&a, &b), &c)) in
+          col.as_chunks_mut::<3>().0.iter_mut().zip(r0.iter().zip(r1).zip(r2))
+        {
+          *dst = [a, b, c];
+        }
+      } else {
+        for k in 0..3 {
+          let s = s0 + k;
+          if s < pad || s - pad >= t {
+            continue;
+          }
+          for (dst, &v) in col.as_chunks_mut::<3>().0.iter_mut().zip(&x[(s - pad) * ch..][..ch]) {
+            dst[k] = v;
+          }
+        }
+      }
+    }
+    return col;
+  }
   for (i, col) in col.chunks_exact_mut(ch * kernel).enumerate() {
     for k in 0..kernel {
       let s = stride * i + k;
@@ -425,7 +489,7 @@ pub fn conv_glu(
           // Source frame plus the padding.
           let Some(src) = (i + k).checked_sub(kernel / 2).filter(|&s| s < t) else { continue };
           for ((a, w), x) in acc.iter_mut().zip(taps).zip(&h[src * 2 * ch..][..ch]) {
-            *a += w * x;
+            *a = w.mul_add(*x, *a);
           }
         }
 
@@ -531,14 +595,46 @@ pub fn relative_attention(
 
 /// Softmax of `scores` × `scale` over the first `t` of each of `m` rows; the rest of a row is
 /// zeroed.
+#[inline(never)]
 fn softmax(scores: &mut [f32], m: usize, t: usize, scale: f32) {
   let tp = t.next_multiple_of(NR);
   for row in scores.chunks_exact_mut(tp).take(m) {
     let (row, pad) = row.split_at_mut(t);
-    let max = row.iter().fold(f32::NEG_INFINITY, |m, &x| m.max(x)) * scale;
-    row.iter_mut().for_each(|x| *x = exp(*x * scale - max));
-    let inv = 1.0 / sum(row.iter().copied());
-    row.iter_mut().for_each(|x| *x *= inv);
+    let mut mmax = [f32::NEG_INFINITY; 16];
+    let (chunks, tail) = row.as_chunks::<16>();
+    for c in chunks {
+      for (a, &v) in mmax.iter_mut().zip(c) {
+        if v > *a {
+          *a = v;
+        }
+      }
+    }
+    let mut max = mmax.into_iter().fold(f32::NEG_INFINITY, |a, b| if b > a { b } else { a });
+    for &v in tail {
+      if v > max {
+        max = v;
+      }
+    }
+    max *= scale;
+    let (chunks, tail) = row.as_chunks_mut::<16>();
+    let mut sum16 = [0.0f32; 16];
+    for c in chunks {
+      for (s, x) in sum16.iter_mut().zip(c.iter_mut()) {
+        let e = exp((*x).mul_add(scale, -max));
+        *x = e;
+        *s += e;
+      }
+    }
+    let mut total = reduce16(sum16);
+    for x in tail {
+      let e = exp((*x).mul_add(scale, -max));
+      *x = e;
+      total += e;
+    }
+    let inv = 1.0 / total;
+    for x in row {
+      *x *= inv;
+    }
     pad.fill(0.0);
   }
 }
@@ -579,15 +675,33 @@ pub fn attend(q: &[f32], kv: &[f32], cols: usize, n: usize, o: &mut [f32], heads
           *s = dot(qh, k) * scale;
         }
 
-        let max = s.iter().fold(f32::NEG_INFINITY, |m, &x| m.max(x));
-        s.iter_mut().for_each(|x| *x = exp(*x - max));
-        let inv = 1.0 / sum(s.iter().copied());
+        let max = s.iter().fold(f32::NEG_INFINITY, |m, &x| if x > m { x } else { m });
+        let (chunks, tail) = s.as_chunks_mut::<16>();
+        let mut sum16 = [0.0f32; 16];
+        for c in chunks {
+          for (a, x) in sum16.iter_mut().zip(c.iter_mut()) {
+            let e = exp(*x - max);
+            *x = e;
+            *a += e;
+          }
+        }
+        let mut total = reduce16(sum16);
+        for x in tail {
+          let e = exp(*x - max);
+          *x = e;
+          total += e;
+        }
+        let inv = 1.0 / total;
         o.fill(0.0);
-        for (s, v) in s.iter().zip(v.chunks_exact(hd)) {
-          o.iter_mut().zip(v).for_each(|(o, v)| *o += s * v);
+        for (&s, v) in s.iter().zip(v.chunks_exact(hd)) {
+          for (o, &v) in o.iter_mut().zip(v) {
+            *o = s.mul_add(v, *o);
+          }
         }
 
-        o.iter_mut().for_each(|o| *o *= inv);
+        for o in o.iter_mut() {
+          *o *= inv;
+        }
       }
     },
   );
@@ -598,14 +712,22 @@ pub fn attend(q: &[f32], kv: &[f32], cols: usize, n: usize, o: &mut [f32], heads
 /// pairs (2i, 2i + 1) for 2i < `rot` rotate, or with `neox` (i, i + rot / 2), as the GPU's `rope`.
 pub fn rope(qkv: &mut [f32], table: &[f32], [heads, hd, rot]: [usize; 3], neox: bool) {
   let half = rot / 2;
-  let (pair, step) = if neox { (half, 1) } else { (1, 2) };
   for (row, t) in qkv.chunks_exact_mut(3 * heads * hd).zip(table.chunks_exact(rot)) {
     let (cos, sin) = t.split_at(half);
     for head in row[..2 * heads * hd].chunks_exact_mut(hd) {
-      for i in 0..half {
-        let (a, b) = (head[step * i], head[step * i + pair]);
-        head[step * i] = a * cos[i] - b * sin[i];
-        head[step * i + pair] = a * sin[i] + b * cos[i];
+      if neox {
+        let (lo, hi) = head[..rot].split_at_mut(half);
+        for (((a, b), &c), &s) in lo.iter_mut().zip(hi.iter_mut()).zip(cos).zip(sin) {
+          let (x, y) = (*a, *b);
+          *a = x * c - y * s;
+          *b = x * s + y * c;
+        }
+      } else {
+        for ((pair, &c), &s) in head[..rot].as_chunks_mut::<2>().0.iter_mut().zip(cos).zip(sin) {
+          let (x, y) = (pair[0], pair[1]);
+          pair[0] = x * c - y * s;
+          pair[1] = x * s + y * c;
+        }
       }
     }
   }
@@ -615,9 +737,33 @@ pub fn rope(qkv: &mut [f32], table: &[f32], [heads, hd, rot]: [usize; 3], neox: 
 /// `eps`), then times `w` and plus `b` per channel. The moments are summed in f64.
 pub fn group_norm(x: &mut [f32], (w, b): (&[f32], &[f32]), eps: f32) {
   let n = x.len() as f64;
-  let mean = x.iter().map(|&v| v as f64).sum::<f64>() / n;
-  let var = x.iter().map(|&v| (v as f64 - mean).powi(2)).sum::<f64>() / n;
-  let (mean, rstd) = (mean as f32, 1.0 / (var as f32 + eps).sqrt());
+  let (chunks, tail) = x.as_chunks::<8>();
+  let mut sum8 = [0.0f64; 8];
+  for c in chunks {
+    for (s, &v) in sum8.iter_mut().zip(c) {
+      *s += v as f64;
+    }
+  }
+  let mut sum =
+    ((sum8[0] + sum8[4]) + (sum8[2] + sum8[6])) + ((sum8[1] + sum8[5]) + (sum8[3] + sum8[7]));
+  for &v in tail {
+    sum += v as f64;
+  }
+  let mean = sum / n;
+  let mut var8 = [0.0f64; 8];
+  for c in chunks {
+    for (s, &v) in var8.iter_mut().zip(c) {
+      let d = v as f64 - mean;
+      *s = d.mul_add(d, *s);
+    }
+  }
+  let mut var =
+    ((var8[0] + var8[4]) + (var8[2] + var8[6])) + ((var8[1] + var8[5]) + (var8[3] + var8[7]));
+  for &v in tail {
+    let d = v as f64 - mean;
+    var = d.mul_add(d, var);
+  }
+  let (mean, rstd) = (mean as f32, 1.0 / ((var / n) as f32 + eps).sqrt());
   for row in x.chunks_exact_mut(w.len()) {
     for ((x, w), b) in row.iter_mut().zip(w).zip(b) {
       *x = (*x - mean) * rstd * w + b;

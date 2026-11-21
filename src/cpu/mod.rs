@@ -25,22 +25,50 @@ pub fn dot(a: &[f32], b: &[f32]) -> f32 {
     return unsafe { x86::dot(a, b) };
   }
 
-  let ((a16, a_tail), (b16, b_tail)) = (a.as_chunks::<16>(), b.as_chunks::<16>());
-  let mut acc = [0f32; 16];
-  for (x, y) in a16.iter().zip(b16) {
-    for ((s, x), y) in acc.iter_mut().zip(x).zip(y) {
-      *s = x.mul_add(*y, *s);
-    }
+  #[cfg(target_arch = "aarch64")]
+  {
+    use std::arch::aarch64::*;
+    let len = a.len().min(b.len());
+    let n = len / 16 * 16;
+    // SAFETY: NEON is part of aarch64 and every load reads 4 floats below `n` <= `len`.
+    let head = unsafe {
+      let (mut a0, mut a1, mut a2, mut a3) =
+        (vdupq_n_f32(0.0), vdupq_n_f32(0.0), vdupq_n_f32(0.0), vdupq_n_f32(0.0));
+      let (ap, bp) = (a.as_ptr(), b.as_ptr());
+      let mut i = 0;
+      while i < n {
+        a0 = vfmaq_f32(a0, vld1q_f32(ap.add(i)), vld1q_f32(bp.add(i)));
+        a1 = vfmaq_f32(a1, vld1q_f32(ap.add(i + 4)), vld1q_f32(bp.add(i + 4)));
+        a2 = vfmaq_f32(a2, vld1q_f32(ap.add(i + 8)), vld1q_f32(bp.add(i + 8)));
+        a3 = vfmaq_f32(a3, vld1q_f32(ap.add(i + 12)), vld1q_f32(bp.add(i + 12)));
+        i += 16;
+      }
+      let lanes = vaddq_f32(vaddq_f32(a0, a2), vaddq_f32(a1, a3));
+      let pair = vadd_f32(vget_low_f32(lanes), vget_high_f32(lanes));
+      vget_lane_f32::<0>(pair) + vget_lane_f32::<1>(pair)
+    };
+    return head + a[n..len].iter().zip(&b[n..len]).map(|(x, y)| x * y).sum::<f32>();
   }
 
-  for n in [8, 4, 2, 1] {
-    let (lo, hi) = acc.split_at_mut(n);
-    for (l, h) in lo.iter_mut().zip(&*hi) {
-      *l += h;
+  #[allow(unreachable_code)]
+  {
+    let ((a16, a_tail), (b16, b_tail)) = (a.as_chunks::<16>(), b.as_chunks::<16>());
+    let mut acc = [0f32; 16];
+    for (x, y) in a16.iter().zip(b16) {
+      for ((s, x), y) in acc.iter_mut().zip(x).zip(y) {
+        *s = x.mul_add(*y, *s);
+      }
     }
-  }
 
-  acc[0] + a_tail.iter().zip(b_tail).map(|(x, y)| x * y).sum::<f32>()
+    for n in [8, 4, 2, 1] {
+      let (lo, hi) = acc.split_at_mut(n);
+      for (l, h) in lo.iter_mut().zip(&*hi) {
+        *l += h;
+      }
+    }
+
+    acc[0] + a_tail.iter().zip(b_tail).map(|(x, y)| x * y).sum::<f32>()
+  }
 }
 
 /// The VNNI the encoders' GEMM takes, for `device`: `", AVX-VNNI"`, `", AVX512-VNNI"` or none.
@@ -335,12 +363,17 @@ fn tile<const R: usize, const F: usize>(w: &[f32], z: &[f32], k: usize) -> [[f32
       })
     })
   };
-  std::array::from_fn(|f| {
-    std::array::from_fn(|r| {
-      let (w, z) = (&w[r * k + n..][..k - n], &z[f * k + n..][..k - n]);
-      acc[f][r] + w.iter().zip(z).map(|(x, y)| x * y).sum::<f32>()
-    })
-  })
+  let mut out = acc;
+  if n < k {
+    for f in 0..F {
+      let zt = &z[f * k + n..][..k - n];
+      for r in 0..R {
+        let wt = &w[r * k + n..][..k - n];
+        out[f][r] += wt.iter().zip(zt).map(|(x, y)| x * y).sum::<f32>();
+      }
+    }
+  }
+  out
 }
 
 #[cfg(not(target_arch = "aarch64"))]
@@ -428,28 +461,61 @@ impl Q8 {
     q.iter().enumerate().map(|(i, &q)| q as f32 * d[i / 32]).collect()
   }
 
-  /// Rows from `r0` times `x` into `out`, four rows per pass over x.
+  /// Rows from `r0` times `x` into `out`, four rows per pass over x, stepping by full 32-weight
+  /// Q8 blocks so each scale is loaded once with no inner bounds checks.
   #[cfg(target_arch = "aarch64")]
   fn rows(&self, r0: usize, x: &[f32], out: &mut [f32]) {
     use std::arch::aarch64::*;
     let k = self.k;
-    let (q, d, x) = (&self.q[r0 * k..][..out.len() * k], &self.d[r0 * k / 32..], &x[..k]);
-    // SAFETY: NEON is part of aarch64; the loads read 16 int8 of a row of `q` and 4 floats of `x`
-    // below k, and a short last group repeats its last row, so every row is inside `q`.
+    let blocks = k / 32;
+    let (q, d, x) =
+      (&self.q[r0 * k..][..out.len() * k], &self.d[r0 * blocks..][..out.len() * blocks], &x[..k]);
+    // SAFETY: NEON is part of aarch64; `k` is a multiple of 32 (`blocks = k / 32`), so every
+    // 32-byte load of `q`, 32-float load of `x`, and scale load of `d` stays in bounds; a short
+    // last group repeats its last row.
     unsafe {
       for (g, out) in out.chunks_mut(4).enumerate() {
-        let row = |j: usize| 4 * g + j.min(out.len() - 1);
+        let last = out.len() - 1;
+        let rows = [4 * g, 4 * g + 1.min(last), 4 * g + 2.min(last), 4 * g + 3.min(last)];
+        let q_ptrs = [
+          q.as_ptr().add(rows[0] * k),
+          q.as_ptr().add(rows[1] * k),
+          q.as_ptr().add(rows[2] * k),
+          q.as_ptr().add(rows[3] * k),
+        ];
+        let d_ptrs = [
+          d.as_ptr().add(rows[0] * blocks),
+          d.as_ptr().add(rows[1] * blocks),
+          d.as_ptr().add(rows[2] * blocks),
+          d.as_ptr().add(rows[3] * blocks),
+        ];
         let mut acc = [[vdupq_n_f32(0.0); 4]; 4];
-        for i in (0..k).step_by(16) {
-          let xs = [0, 1, 2, 3].map(|c| vld1q_f32(x.as_ptr().add(i + 4 * c)));
-          for (j, acc) in acc.iter_mut().enumerate() {
-            let at = row(j) * k + i;
-            let v = vld1q_s8(q.as_ptr().add(at));
-            let (lo, hi) = (vmovl_s8(vget_low_s8(v)), vmovl_high_s8(v));
-            let w = [vget_low_s16(lo), vget_high_s16(lo), vget_low_s16(hi), vget_high_s16(hi)];
-            for (a, (w, x)) in acc.iter_mut().zip(w.into_iter().zip(xs)) {
-              let w = vmulq_n_f32(vcvtq_f32_s32(vmovl_s16(w)), d[at / 32]);
-              *a = vfmaq_f32(*a, w, x);
+        for blk in 0..blocks {
+          let xp = x.as_ptr().add(blk * 32);
+          let xs0 =
+            [vld1q_f32(xp), vld1q_f32(xp.add(4)), vld1q_f32(xp.add(8)), vld1q_f32(xp.add(12))];
+          let xs1 = [
+            vld1q_f32(xp.add(16)),
+            vld1q_f32(xp.add(20)),
+            vld1q_f32(xp.add(24)),
+            vld1q_f32(xp.add(28)),
+          ];
+          for j in 0..4 {
+            let scale = *d_ptrs[j].add(blk);
+            let qp = q_ptrs[j].add(blk * 32);
+            let v0 = vld1q_s8(qp);
+            let (lo0, hi0) = (vmovl_s8(vget_low_s8(v0)), vmovl_high_s8(v0));
+            let w0 = [vget_low_s16(lo0), vget_high_s16(lo0), vget_low_s16(hi0), vget_high_s16(hi0)];
+            for c in 0..4 {
+              let w = vmulq_n_f32(vcvtq_f32_s32(vmovl_s16(w0[c])), scale);
+              acc[j][c] = vfmaq_f32(acc[j][c], w, xs0[c]);
+            }
+            let v1 = vld1q_s8(qp.add(16));
+            let (lo1, hi1) = (vmovl_s8(vget_low_s8(v1)), vmovl_high_s8(v1));
+            let w1 = [vget_low_s16(lo1), vget_high_s16(lo1), vget_low_s16(hi1), vget_high_s16(hi1)];
+            for c in 0..4 {
+              let w = vmulq_n_f32(vcvtq_f32_s32(vmovl_s16(w1[c])), scale);
+              acc[j][c] = vfmaq_f32(acc[j][c], w, xs1[c]);
             }
           }
         }
