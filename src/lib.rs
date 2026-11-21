@@ -342,6 +342,13 @@ pub fn cpu_path() -> &'static str {
   cpu::path()
 }
 
+/// Ask macOS to schedule the benchmark's main and CPU pool threads on performance cores; for
+/// `wavo bench`, not part of the API.
+#[doc(hidden)]
+pub fn bench_prefer_p_cores() {
+  cpu::bench_prefer_p_cores();
+}
+
 /// A speech-to-text model loaded on the GPU or the Neural Engine.
 ///
 /// Load it once with [`Model::load`], then call [`Model::transcribe`] for each recording. It is
