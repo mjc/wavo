@@ -363,8 +363,19 @@ pub fn gemv(x: &[f32], l: &Linear, c: &mut [f32], epilogue: Epilogue) {
 fn to_half(x: f32) -> f32 {
   let b = x.to_bits();
   let normal = f32::from_bits((b + 0xfff + ((b >> 13) & 1)) & 0xffff_e000);
-  let sub = (x * 16_777_216.0).round_ties_even() * (1.0 / 16_777_216.0);
-  if x.abs() < f32::from_bits(0x3880_0000) { sub } else { normal }
+  #[cfg(any(target_arch = "aarch64", target_feature = "sse4.1"))]
+  {
+    let sub = (x * 16_777_216.0).round_ties_even() * (1.0 / 16_777_216.0);
+    if x.abs() < f32::from_bits(0x3880_0000) { sub } else { normal }
+  }
+  #[cfg(not(any(target_arch = "aarch64", target_feature = "sse4.1")))]
+  {
+    if x.abs() < f32::from_bits(0x3880_0000) {
+      (x * 16_777_216.0).round_ties_even() * (1.0 / 16_777_216.0)
+    } else {
+      normal
+    }
+  }
 }
 
 /// Runs a GEMM's jobs over `l`'s panels of `bytes` each: a job packs a group of panels that fits
@@ -549,7 +560,7 @@ fn finish_nr(c: &mut [f32; NR], acc: &[f32; NR], bias: &[f32; NR], epilogue: Epi
     }
     Epilogue::Residual(alpha) => {
       for i in 0..NR {
-        c[i] = alpha.mul_add(acc[i] + bias[i], c[i]);
+        c[i] = ops::fma(alpha, acc[i] + bias[i], c[i]);
       }
     }
     Epilogue::Gelu => {
