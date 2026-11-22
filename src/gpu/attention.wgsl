@@ -137,8 +137,43 @@ var<workgroup> fq: array<vec2<f32>, 1024>;
 var<workgroup> fk: array<vec4<f32>, 512>;
 // Probabilities as [key][query] pairs.
 var<workgroup> fp: array<vec2<f32>, 512>;
-// Per thread column x, a value per query: [x][query].
+// Per query, a value per thread column x: [query][x].
 var<workgroup> fx: array<f32, 256>;
+
+// Maximum across the 8 key lanes (l.x = 0..7) for a pair of queries at l.y. subgroup.wgsl replaces
+// these with `subgroupShuffleXor` when supported.
+fn max_pair(v: vec2<f32>, l: vec2<u32>) -> vec2<f32> {
+  let r0 = 2u * l.y;
+  fx[r0 * 8u + l.x] = v.x;
+  fx[(r0 + 1u) * 8u + l.x] = v.y;
+  workgroupBarrier();
+  var top = vec2(-3.0e38);
+  for (var i = 0u; i < 8u; i++) {
+    top = max(top, vec2(fx[r0 * 8u + i], fx[(r0 + 1u) * 8u + i]));
+  }
+  return top;
+}
+
+// Sum across the 8 key lanes (l.x = 0..7) for a pair of queries at l.y.
+fn sum_pair(v: vec2<f32>, l: vec2<u32>) -> vec2<f32> {
+  let r0 = 2u * l.y;
+  fx[r0 * 8u + l.x] = v.x;
+  fx[(r0 + 1u) * 8u + l.x] = v.y;
+  workgroupBarrier();
+  var total = vec2(0.0);
+  for (var i = 0u; i < 8u; i++) {
+    total += vec2(fx[r0 * 8u + i], fx[(r0 + 1u) * 8u + i]);
+  }
+  return total;
+}
+
+// `max_pair` already synced the workgroup; subgroup.wgsl puts a barrier before staging v over k/q.
+fn sync_kv() {
+}
+
+fn probe_reduce(l: vec2<u32>, lid: u32, sg_size: u32) -> f32 {
+  return 0.0;
+}
 
 // Without relative positions, head_dim ≤ 64 and a multiple of 4: attention without the scores in
 // memory. A workgroup takes 32 queries of one head and walks the keys in blocks of 32 with an online
@@ -150,6 +185,13 @@ fn flash(
   @builtin(local_invocation_id) l: vec3<u32>,
   @builtin(local_invocation_index) lid: u32,
 ) {
+  if (p.t == 0u) {
+    let ok = probe_reduce(l.xy, lid, 0u);
+    if (lid == 0u) {
+      fl_o[0] = vec4(ok);
+    }
+    return;
+  }
   let h4 = p.head_dim / 4u;
   let q0 = wg.x * 32u;
   let head = wg.y * p.head_dim;
@@ -207,13 +249,11 @@ fn flash(
     let valid = keys < vec4(p.t - j0);
     let x0 = select(vec4(-3.0e38), s0 * p.scale, valid);
     let x1 = select(vec4(-3.0e38), s1 * p.scale, valid);
-    fx[l.x * 32u + r0] = max(max(x0.x, x0.y), max(x0.z, x0.w));
-    fx[l.x * 32u + r0 + 1u] = max(max(x1.x, x1.y), max(x1.z, x1.w));
-    workgroupBarrier();
-    var top = m;
-    for (var i = 0u; i < 8u; i++) {
-      top = max(top, vec2(fx[i * 32u + r0], fx[i * 32u + r0 + 1u]));
-    }
+    let row_max = vec2(
+      max(max(x0.x, x0.y), max(x0.z, x0.w)),
+      max(max(x1.x, x1.y), max(x1.z, x1.w)),
+    );
+    let top = max(m, max_pair(row_max, l.xy));
     let alpha = exp(m - top);
     m = top;
     let e0 = exp(x0 - top.x);
@@ -227,6 +267,7 @@ fn flash(
     fp[(4u * l.x + 1u) * 16u + l.y] = vec2(e0.y, e1.y);
     fp[(4u * l.x + 2u) * 16u + l.y] = vec2(e0.z, e1.z);
     fp[(4u * l.x + 3u) * 16u + l.y] = vec2(e0.w, e1.w);
+    sync_kv();
     for (var e = lid; e < 512u; e += 128u) {
       let r = e / 16u;
       let c = e % 16u;
@@ -246,32 +287,28 @@ fn flash(
       oa1 += pj.y * va;
       ob1 += pj.y * vb;
     }
-    workgroupBarrier();
+    if (j0 + 32u < p.t) {
+      workgroupBarrier();
+    }
   }
   // Each thread summed only its own keys' probabilities.
-  fx[l.x * 32u + r0] = sum.x;
-  fx[l.x * 32u + r0 + 1u] = sum.y;
-  workgroupBarrier();
-  var total = vec2(0.0);
-  for (var i = 0u; i < 8u; i++) {
-    total += vec2(fx[i * 32u + r0], fx[i * 32u + r0 + 1u]);
-  }
+  let inv = 1.0 / sum_pair(sum, l.xy);
   let o = ((q0 + r0) * p.ch + head) / 4u;
   let ch4 = p.ch / 4u;
   if (q0 + r0 < p.t) {
     if (l.x < h4) {
-      fl_o[o + l.x] = oa0 / total.x;
+      fl_o[o + l.x] = oa0 * inv.x;
     }
     if (8u + l.x < h4) {
-      fl_o[o + 8u + l.x] = ob0 / total.x;
+      fl_o[o + 8u + l.x] = ob0 * inv.x;
     }
   }
   if (q0 + r0 + 1u < p.t) {
     if (l.x < h4) {
-      fl_o[o + ch4 + l.x] = oa1 / total.y;
+      fl_o[o + ch4 + l.x] = oa1 * inv.y;
     }
     if (8u + l.x < h4) {
-      fl_o[o + ch4 + 8u + l.x] = ob1 / total.y;
+      fl_o[o + ch4 + 8u + l.x] = ob1 * inv.y;
     }
   }
 }
@@ -283,8 +320,8 @@ fn flash(
 // A chunk of 32 columns of (q + u, q + v) as [column][query pair] quads (q + u of both queries,
 // then q + v of both); later half a block of v, 64 columns as [key][column quad].
 var<workgroup> rq: array<vec4<f32>, 512>;
-// The chunk's k as [column][key pair].
-var<workgroup> rk: array<vec2<f32>, 512>;
+// The chunk's k as [column][key quad].
+var<workgroup> rk: array<vec4<f32>, 256>;
 // The chunk's 64 rows of positions as [column][row pair].
 var<workgroup> rr: array<vec2<f32>, 1024>;
 
@@ -313,6 +350,13 @@ fn relative(
   @builtin(local_invocation_id) l: vec3<u32>,
   @builtin(local_invocation_index) lid: u32,
 ) {
+  if (p.t == 0u) {
+    let ok = probe_reduce(l.xy, lid, 0u);
+    if (lid == 0u) {
+      rl_o[0] = vec4(ok);
+    }
+    return;
+  }
   let h4 = p.head_dim / 4u;
   let ch4 = p.ch / 4u;
   let s4 = p.stride / 4u;
@@ -362,25 +406,22 @@ fn relative(
         rq[o + 32u] = vec4(u0.z, u1.z, v0.z, v1.z);
         rq[o + 48u] = vec4(u0.w, u1.w, v0.w, v1.w);
       }
-      {
-        // Key pair lid % 16, column quad lid / 16.
-        let r = j0 + 2u * (lid % 16u);
-        let c = c0 + lid / 16u;
-        var k0 = vec4(0.0);
-        var k1 = vec4(0.0);
-        if (c < h4) {
-          if (r < p.t) {
-            k0 = rl_qk[r * s4 + ch4 + head4 + c];
-          }
-          if (r + 1u < p.t) {
-            k1 = rl_qk[(r + 1u) * s4 + ch4 + head4 + c];
+      if (lid < 64u) {
+        // Key quad lid % 8, column quad lid / 8.
+        let r = j0 + 4u * (lid % 8u);
+        let c = c0 + lid / 8u;
+        var k: array<vec4<f32>, 4>;
+        for (var i = 0u; i < 4u; i++) {
+          k[i] = vec4(0.0);
+          if (r + i < p.t && c < h4) {
+            k[i] = rl_qk[(r + i) * s4 + ch4 + head4 + c];
           }
         }
-        let o = 4u * (lid / 16u) * 16u + lid % 16u;
-        rk[o] = vec2(k0.x, k1.x);
-        rk[o + 16u] = vec2(k0.y, k1.y);
-        rk[o + 32u] = vec2(k0.z, k1.z);
-        rk[o + 48u] = vec2(k0.w, k1.w);
+        let o = 4u * (lid / 8u) * 8u + lid % 8u;
+        rk[o] = vec4(k[0].x, k[1].x, k[2].x, k[3].x);
+        rk[o + 8u] = vec4(k[0].y, k[1].y, k[2].y, k[3].y);
+        rk[o + 16u] = vec4(k[0].z, k[1].z, k[2].z, k[3].z);
+        rk[o + 24u] = vec4(k[0].w, k[1].w, k[2].w, k[3].w);
       }
       for (var e = lid; e < 256u; e += 128u) {
         // Row pair e % 32, column quad e / 32.
@@ -405,7 +446,7 @@ fn relative(
       workgroupBarrier();
       for (var c = 0u; c < 32u; c++) {
         let q = rq[c * 16u + l.y];
-        let k = vec4(rk[c * 16u + 2u * l.x], rk[c * 16u + 2u * l.x + 1u]);
+        let k = rk[c * 8u + l.x];
         let pa = rr[c * 32u + pair];
         let pb = rr[c * 32u + pair + 1u];
         let pc = rr[c * 32u + pair + 2u];
@@ -414,18 +455,18 @@ fn relative(
         b0 += q.z * vec4(pa.y, pb.x, pb.y, pc.x);
         b1 += q.w * vec4(pa.x, pa.y, pb.x, pb.y);
       }
-      workgroupBarrier();
+      if (c0 + 8u < h4) {
+        workgroupBarrier();
+      }
     }
     let valid = keys < vec4(p.t - j0);
     let x0 = select(vec4(-3.0e38), (a0 + b0) * p.scale, valid);
     let x1 = select(vec4(-3.0e38), (a1 + b1) * p.scale, valid);
-    fx[l.x * 32u + r0] = max(max(x0.x, x0.y), max(x0.z, x0.w));
-    fx[l.x * 32u + r0 + 1u] = max(max(x1.x, x1.y), max(x1.z, x1.w));
-    workgroupBarrier();
-    var top = m;
-    for (var i = 0u; i < 8u; i++) {
-      top = max(top, vec2(fx[i * 32u + r0], fx[i * 32u + r0 + 1u]));
-    }
+    let row_max = vec2(
+      max(max(x0.x, x0.y), max(x0.z, x0.w)),
+      max(max(x1.x, x1.y), max(x1.z, x1.w)),
+    );
+    let top = max(m, max_pair(row_max, l.xy));
     let alpha = exp(m - top);
     m = top;
     let e0 = exp(x0 - top.x);
@@ -443,6 +484,7 @@ fn relative(
     fp[(4u * l.x + 1u) * 16u + l.y] = vec2(e0.y, e1.y);
     fp[(4u * l.x + 2u) * 16u + l.y] = vec2(e0.z, e1.z);
     fp[(4u * l.x + 3u) * 16u + l.y] = vec2(e0.w, e1.w);
+    sync_kv();
     stage_v(0u, j0, head4, lid);
     for (var j = 0u; j < 32u; j++) {
       let pj = fp[j * 16u + l.y];
@@ -453,8 +495,8 @@ fn relative(
       oa1 += pj.y * va;
       ob1 += pj.y * vb;
     }
-    workgroupBarrier();
     if (p.head_dim > 64u) {
+      workgroupBarrier();
       stage_v(1u, j0, head4, lid);
       for (var j = 0u; j < 32u; j++) {
         let pj = fp[j * 16u + l.y];
@@ -465,19 +507,15 @@ fn relative(
         oc1 += pj.y * va;
         od1 += pj.y * vb;
       }
+    }
+    if (j0 + 32u < p.t) {
       workgroupBarrier();
     }
   }
-  fx[l.x * 32u + r0] = sum.x;
-  fx[l.x * 32u + r0 + 1u] = sum.y;
-  workgroupBarrier();
-  var total = vec2(0.0);
-  for (var i = 0u; i < 8u; i++) {
-    total += vec2(fx[i * 32u + r0], fx[i * 32u + r0 + 1u]);
-  }
+  let inv = 1.0 / sum_pair(sum, l.xy);
   let o = (q0 + r0) * ch4 + head4;
-  var out = array(oa0 / total.x, ob0 / total.x, oc0 / total.x, od0 / total.x);
-  var out1 = array(oa1 / total.y, ob1 / total.y, oc1 / total.y, od1 / total.y);
+  var out = array(oa0 * inv.x, ob0 * inv.x, oc0 * inv.x, od0 * inv.x);
+  var out1 = array(oa1 * inv.y, ob1 * inv.y, oc1 * inv.y, od1 * inv.y);
   for (var u = 0u; u < 4u; u++) {
     let c = 8u * u + l.x;
     if (c < h4) {
