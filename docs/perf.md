@@ -226,11 +226,11 @@ two numbers (A/B/A, warm median unless stated), kept or rejected and why.
   over `[yr; y]`, stacked `[W_q; W_k; W_v]` keeping Q8_0/F16/F32 storage and zero extra FLOPs):
   GPU dispatches per call drop 262 → 246 on `gigaam-v3` (16 layers) and 390 → 366 on
   `gigaam-multilingual` (24 layers; also 16/24 fewer `cast` dispatches on the tensor tier), and
-  CPU Conformer `gemm` calls drop 128 → 112 on `gigaam-v3`. Apple M1 was heavily loaded during
-  A/B/A (load avg 12–17, A1 vs A2 varied >2×: GPU `ru-short` 251.6 / 503.8 / 568.7, `ru-long`
-  889.0 / 881.3 / 1284.9, CPU `ru-short` 897.1 / 1258.6 / 1600.7, `ru-long` 2211.7 / 2238.8 /
-  1762.4 ms); needs a quiet rerun for wall-time deltas. All 10 GigaAM GPU/CPU tests and all 4
-  local GPU kernel tiers (`portable`, `portable-32`, `portable-cpu`, `matrix8`) pass exact. Kept.
+  CPU Conformer `gemm` calls drop 128 → 112 on `gigaam-v3`. Warm median A/B/A on `gigaam-v3`
+  `ru-long`: Apple M1 Metal 395.8 / 385.4 / 398.7ms (−3.0%, portable 1063.9 / 1047.3 / 1064.0ms),
+  RX 5700 XT 153.1 / 150.6 / 152.8ms (−1.5%), Radeon 760M 356.1 / 354.8 / 356.3ms, Quadro P2000
+  592.8 / 565.5 / 582.1ms (−3.7%); CPU `ru-long`: Ryzen 5 8600G 787.8 / 739.1 / 749.5ms,
+  Ryzen 9 5950X 3260 / 3025 / 3316ms, Apple M1 1756 / 1725 / 1724ms. Kept.
 
 - 2026-11-19, Whisper Q5_K, Apple M1: cache `q4k_dm` in a private scale/minimum pair keyed
   by the absolute group of 32 in `gemm_fast.wgsl`. At ROWS=64 each thread reuses it over four
