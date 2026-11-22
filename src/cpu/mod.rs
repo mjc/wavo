@@ -1079,4 +1079,82 @@ mod tests {
     });
     assert!(reused.load(Ordering::Relaxed), "expected pool worker reuse after panics");
   }
+
+  #[test]
+  fn q5_0_matches_dot() {
+    // Each block is codes 0..31 at scale 0.5, which quantizes back to itself. 70 rows: a full
+    // 64-row block and a short one whose last 4-row group has 2 rows.
+    let (k, rows) = (64, 70);
+    let v: Vec<f32> = (0..rows * k)
+      .map(|i| {
+        let d = 0.5 * (1 + ((i / 32) % 3)) as f32;
+        ((i % 32) as f32 - 16.0) * d
+      })
+      .collect();
+    let q5 = crate::gguf::quantize_q5_0(&v);
+    let x: Vec<f32> = (0..k).map(|i| (i * 31 % 17) as f32 / 8.0 - 1.0).collect();
+    let want: Vec<u32> = v.chunks_exact(k).map(|r| super::dot(r, &x).to_bits()).collect();
+    let g = Gguf::with_tensors(&[("w", &[k, rows], Type::Q5_0, &q5)]);
+    let w = super::Matrix::new(&g.tensor("w", &[k, rows]).unwrap()).unwrap();
+    for r in 0..rows {
+      assert_eq!(w.row(r), v[r * k..(r + 1) * k], "row {r}");
+    }
+    let [got] = super::matvecs([(&w, &x)]);
+    assert_eq!(got.into_iter().map(f32::to_bits).collect::<Vec<_>>(), want);
+  }
+
+  #[test]
+  fn block32_matches_dot() {
+    // Grids that quantize back to themselves. Q4_0 stays on the Q8 tile; Q4_1 and Q5_1 expand.
+    // Q4_K stays packed; its block is 256, so it has its own test.
+    // 70 rows: a full 64-row block and a short one whose last 4-row group has 2 rows.
+    let (k, rows) = (64, 70);
+    let x: Vec<f32> = (0..k).map(|i| (i * 31 % 17) as f32 / 8.0 - 1.0).collect();
+    for (ty, levels, offset) in
+      [(Type::Q4_0, 16, -8.0), (Type::Q4_1, 16, -1.0), (Type::Q5_1, 32, 0.0)]
+    {
+      let v: Vec<f32> = (0..rows * k)
+        .map(|i| {
+          let scale = 0.5 * (1 + ((i / 32) % 3)) as f32;
+          let code = (i % levels) as f32;
+          if ty == Type::Q4_0 { (code - 8.0) * scale } else { code * scale + offset }
+        })
+        .collect();
+      let bytes = match ty {
+        Type::Q4_0 => crate::gguf::quantize_q4_0(&v),
+        Type::Q4_1 => crate::gguf::quantize_q4_1(&v),
+        Type::Q5_1 => crate::gguf::quantize_q5_1(&v),
+        _ => unreachable!(),
+      };
+      let want: Vec<u32> = v.chunks_exact(k).map(|r| super::dot(r, &x).to_bits()).collect();
+      let g = Gguf::with_tensors(&[("w", &[k, rows], ty, &bytes)]);
+      let w = super::Matrix::new(&g.tensor("w", &[k, rows]).unwrap()).unwrap();
+      for r in 0..rows {
+        assert_eq!(w.row(r), v[r * k..(r + 1) * k], "{ty:?}, row {r}");
+      }
+      let [got] = super::matvecs([(&w, &x)]);
+      assert_eq!(got.into_iter().map(f32::to_bits).collect::<Vec<_>>(), want, "{ty:?}");
+    }
+  }
+
+  #[test]
+  fn q4_k_matches_dot() {
+    // The packed row matches the dequantized block, and the matvec matches a dot of that row.
+    // 256×6 hits a short last group of rows. 320×4 crosses a 256-weight block inside the row.
+    for (k, rows) in [(256, 6), (320, 4)] {
+      let v: Vec<f32> = (0..rows * k).map(|i| (i % 19) as f32 / 3.0 - 2.0).collect();
+      let bytes = crate::gguf::quantize_q4_k(&v);
+      let x: Vec<f32> = (0..k).map(|i| (i * 31 % 17) as f32 / 8.0 - 1.0).collect();
+      let g = Gguf::with_tensors(&[("w", &[k, rows], Type::Q4_K, &bytes)]);
+      let t = g.tensor("w", &[k, rows]).unwrap();
+      let deq = t.to_f32().unwrap();
+      let w = super::Matrix::new(&t).unwrap();
+      for r in 0..rows {
+        assert_eq!(w.row(r), deq[r * k..(r + 1) * k], "k {k}, row {r}");
+      }
+      let want: Vec<u32> = deq.chunks_exact(k).map(|r| super::dot(r, &x).to_bits()).collect();
+      let [got] = super::matvecs([(&w, &x)]);
+      assert_eq!(got.into_iter().map(f32::to_bits).collect::<Vec<_>>(), want, "k {k}");
+    }
+  }
 }
