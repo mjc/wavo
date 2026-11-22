@@ -198,6 +198,20 @@ two numbers (A/B/A, warm median unless stated), kept or rejected and why.
 
 ### GEMM
 
+- 2026-11-21, Apple M1 (Metal), `gemm_fast.wgsl` cooperative staging:
+  - Keeping F16 weights directly in `f16` via a dedicated `gemm_f16` entry point reading
+    `@group(0) @binding(3) wf16: array<vec4<f16>>` instead of `unpack2x16float` + `f16(...)`
+    (Naga 30.0.2 rejects `bitcast<vec2<f16>>(u32)` because `bitcast` preserves 32-bit element
+    width): `gpu::tests::gemm` and smoke + `whisper_large_v3_turbo` fixtures exact; M1 warm
+    medians within noise (`gigaam-v3` `ru-long` 409.5 vs 409.6 ms; `parakeet-v3` `jfk` 285.5 /
+    291.8 / 276.7 ms, min 272.4 / 271.8 / 262.4 ms). Kept (avoids redundant f16→f32→f16
+    conversions in `stage_w_f16`).
+  - Contiguous K staging (`STRIDE = KS + 8` row stride, `coopLoad<BM>` transpose for W instead of
+    scalar scatter in `stage_w`): fixtures exact, but slower on M1 Metal (`gigaam-v3` `ru-long`
+    A/B/A 458.2 / 482.2 / 457.0 ms, +5.2%; `parakeet-v3` `jfk` 293.4 / 305.9 / 281.2 ms, min
+    273.0 / 285.5 / 273.7 ms). Rejected on M1 Metal (`simdgroup_load` with transpose and padded
+    shared-memory stride cost more than the pre-transposed fragment staging).
+
 - 2026-11-07, all models, the portable GEMM rounds `a` to f16 as `kernel_mul_mm` does (PR #88):
   without it ivrit he-long gave `החללה` where the fixture has `החלאה`, a near-tie. This reverses
   the rejection of rounding `a` in the 2026-10-09 entry on rounding W below, now that a fixture
