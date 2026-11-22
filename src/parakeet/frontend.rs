@@ -8,7 +8,8 @@
 use std::f64::consts::PI;
 use std::ops::Range;
 
-use crate::fft::Fft;
+use crate::cpu::ops;
+use crate::fft::Rfft8F64;
 
 pub const MELS: usize = 128;
 pub const N_FFT: usize = 512;
@@ -18,14 +19,18 @@ pub const PRE_EMPHASIS: f32 = 0.97;
 pub const F_MAX: f32 = 8000.0;
 const BINS: usize = N_FFT / 2 + 1;
 const LOG_EPS: f32 = 1.0 / (1 << 24) as f32;
+/// Frames per L1-resident pre-emphasis tile (~44 KiB in `f64`, plus ~40 KiB FFT scratch).
+const TILE_FRAMES: usize = 32;
+/// Minimum frames before splitting across 4 threads beats thread-spawn overhead.
+const PAR_MIN_FRAMES: usize = 256;
 
 pub struct Frontend {
   window: Vec<f64>,
-  /// `[MELS][BINS]`
-  filters: Vec<f32>,
-  /// Per filter, its nonzero bins.
-  spans: Vec<Range<usize>>,
-  fft: Fft<f64>,
+  /// Concatenated nonzero weights of every mel filter, in filter order.
+  weights: Vec<f32>,
+  /// Per filter, `(first_bin, len)` of its nonzero weights.
+  spans: Vec<(u16, u16)>,
+  fft: Rfft8F64,
 }
 
 impl Frontend {
@@ -38,13 +43,20 @@ impl Frontend {
       })
       .collect();
     let filters = slaney_filterbank();
-    let spans = (filters.as_chunks::<BINS>().0.iter())
-      .map(|f| {
-        let lo = f.iter().position(|&w| w != 0.0).unwrap_or(0);
-        lo..f.iter().rposition(|&w| w != 0.0).map_or(lo, |i| i + 1)
-      })
-      .collect();
-    Self { window, filters, spans, fft: Fft::new(N_FFT) }
+    let mut weights = Vec::new();
+    let mut spans = Vec::with_capacity(MELS);
+    for f in filters.as_chunks::<BINS>().0 {
+      if let (Some(lo), Some(hi)) =
+        (f.iter().position(|&w| w != 0.0), f.iter().rposition(|&w| w != 0.0))
+      {
+        let len = hi + 1 - lo;
+        weights.extend_from_slice(&f[lo..lo + len]);
+        spans.push((lo as u16, len as u16));
+      } else {
+        spans.push((0, 0));
+      }
+    }
+    Self { window, weights, spans, fft: Rfft8F64::new(N_FFT) }
   }
 
   /// Features of 16 kHz PCM, time-major `[pcm.len() / 160 + 1][MELS]`; empty below 3 frames, too
@@ -56,55 +68,125 @@ impl Frontend {
     }
 
     let mut mel = self.log_mel(pcm, 0..frames);
-    // Unbiased statistics over all frames but the last.
+    // Unbiased statistics over all frames but the last, row-major so every pass vectorizes.
     let n = frames - 1;
-    for m in 0..MELS {
-      let column = || (0..n).map(|t| mel[t * MELS + m] as f64);
-      let mean = column().sum::<f64>() / n as f64;
-      let var = column().map(|x| (x - mean) * (x - mean)).sum::<f64>() / (n - 1) as f64;
-      let inv = 1.0 / (var.sqrt() + 1e-5f32 as f64);
-      for t in 0..n {
-        mel[t * MELS + m] = ((mel[t * MELS + m] as f64 - mean) * inv) as f32;
+    let (body, last) = mel.split_at_mut(n * MELS);
+    let mut mean = [0.0f64; MELS];
+    for row in body.as_chunks::<MELS>().0 {
+      for (m, &x) in mean.iter_mut().zip(row) {
+        *m += x as f64;
       }
-      mel[n * MELS + m] = 0.0;
     }
+    let inv_n = 1.0 / n as f64;
+    for m in &mut mean {
+      *m *= inv_n;
+    }
+    let mut var = [0.0f64; MELS];
+    for row in body.as_chunks::<MELS>().0 {
+      for ((v, &m), &x) in var.iter_mut().zip(&mean).zip(row) {
+        let d = x as f64 - m;
+        *v += d * d;
+      }
+    }
+    let inv_nm1 = 1.0 / (n - 1) as f64;
+    let eps = 1e-5f32 as f64;
+    let mut inv = [0.0f64; MELS];
+    for (iv, &v) in inv.iter_mut().zip(&var) {
+      *iv = 1.0 / ((v * inv_nm1).sqrt() + eps);
+    }
+    for row in body.as_chunks_mut::<MELS>().0 {
+      for ((x, &m), &iv) in row.iter_mut().zip(&mean).zip(&inv) {
+        *x = ((*x as f64 - m) * iv) as f32;
+      }
+    }
+    last.fill(0.0);
     mel
   }
 
   /// The log-mel of `frames`, time-major `[frames.len()][MELS]`: frames of the whole `pcm`, up to
   /// `pcm.len() / 160 + 1` of them, computed from only the samples they cover.
   pub fn log_mel(&self, pcm: &[f32], frames: Range<usize>) -> Vec<f32> {
-    // Samples `pad - N_FFT / 2..` of the pre-emphasized audio with N_FFT / 2 zeros on each side.
-    let pad = frames.start * HOP;
-    let len = frames.len().saturating_sub(1) * HOP + N_FFT;
-    let padded: Vec<f64> = (pad..pad + len)
-      .map(|j| match j.checked_sub(N_FFT / 2) {
-        Some(0) => pcm[0] as f64,
-        Some(i) if i < pcm.len() => pcm[i] as f64 - PRE_EMPHASIS as f64 * pcm[i - 1] as f64,
-        _ => 0.0,
-      })
-      .collect();
-    let mut mel = Vec::with_capacity(frames.len() * MELS);
-    let (mut frame, mut buf) = ([0f64; N_FFT], [0f64; 4 * N_FFT]);
-    let mut power = [0f32; BINS];
-    for t in 0..frames.len() {
-      for ((x, s), w) in frame.iter_mut().zip(&padded[t * HOP..]).zip(&self.window) {
-        *x = s * w;
+    let n_frames = frames.len();
+    if n_frames == 0 {
+      return Vec::new();
+    }
+    let mut mel = vec![0f32; n_frames * MELS];
+    if n_frames >= PAR_MIN_FRAMES {
+      let n_threads = crate::cpu::p_cores().clamp(1, 4);
+      let per_frames = n_frames.div_ceil(n_threads).next_multiple_of(8);
+      let per = per_frames * MELS;
+      let chunks: Vec<(usize, &mut [f32])> =
+        mel.chunks_mut(per).enumerate().map(|(i, s)| (frames.start + i * per_frames, s)).collect();
+      crate::cpu::par_each(
+        chunks.into_iter(),
+        || (),
+        |_, (f0, slice)| {
+          self.log_mel_range(pcm, f0, slice);
+        },
+      );
+    } else {
+      self.log_mel_range(pcm, frames.start, &mut mel);
+    }
+    mel
+  }
+
+  fn log_mel_range(&self, pcm: &[f32], frame0: usize, out: &mut [f32]) {
+    let total_frames = out.len() / MELS;
+    let tile_cap = (TILE_FRAMES.min(total_frames) - 1) * HOP + N_FFT;
+    let mut padded = vec![0.0f64; tile_cap];
+    let (mut re, mut im) = ([[0f64; 8]; N_FFT / 2], [[0f64; 8]; N_FFT / 2]);
+    let mut power = [[0f32; 8]; BINS];
+    let half = N_FFT / 2;
+    let pe = PRE_EMPHASIS as f64;
+
+    for (tile_idx, tile_out) in out.chunks_mut(TILE_FRAMES * MELS).enumerate() {
+      let tile_start = frame0 + tile_idx * TILE_FRAMES;
+      let tile_frames = tile_out.len() / MELS;
+      let pad = tile_start * HOP;
+      let len = (tile_frames - 1) * HOP + N_FFT;
+      let buf = &mut padded[..len];
+
+      let mut fill_lo = 0usize;
+      let mut fill_hi = 0usize;
+      if !pcm.is_empty() {
+        let i_lo = pad.saturating_sub(half).max(1);
+        let i_hi = (pad + len).saturating_sub(half).min(pcm.len());
+        if i_lo < i_hi {
+          fill_lo = i_lo + half - pad;
+          fill_hi = i_hi + half - pad;
+          let dst = &mut buf[fill_lo..fill_hi];
+          for ((d, &cur), &prev) in
+            dst.iter_mut().zip(&pcm[i_lo..i_hi]).zip(&pcm[i_lo - 1..i_hi - 1])
+          {
+            *d = cur as f64 - pe * prev as f64;
+          }
+        }
       }
-      let (re, im) = self.fft.forward(&frame, &mut buf);
-      for ((p, re), im) in power.iter_mut().zip(re).zip(im) {
-        *p = (re * re + im * im) as f32;
+      buf[..fill_lo].fill(0.0);
+      buf[fill_hi..].fill(0.0);
+      if !pcm.is_empty() && pad <= half && half < pad + len {
+        buf[half - pad] = pcm[0] as f64;
       }
-      // Each filter as a chain of f32 fused multiply-adds in bin order: bitwise equal to the
-      // reference's sgemm on Apple Silicon. The zero weights outside a span would add exact zeros.
-      for (filter, span) in self.filters.as_chunks::<BINS>().0.iter().zip(&self.spans) {
-        let e = (filter[span.clone()].iter().zip(&power[span.clone()]))
-          .fold(0f32, |s, (w, p)| w.mul_add(*p, s));
-        mel.push((e + LOG_EPS).ln());
+
+      for (batch, chunk) in tile_out.chunks_mut(8 * MELS).enumerate() {
+        let base = batch * 8;
+        let count = chunk.len() / MELS;
+        let last = count - 1;
+        let fs = [
+          &buf[base * HOP..][..N_FFT],
+          &buf[(base + 1.min(last)) * HOP..][..N_FFT],
+          &buf[(base + 2.min(last)) * HOP..][..N_FFT],
+          &buf[(base + 3.min(last)) * HOP..][..N_FFT],
+          &buf[(base + 4.min(last)) * HOP..][..N_FFT],
+          &buf[(base + 5.min(last)) * HOP..][..N_FFT],
+          &buf[(base + 6.min(last)) * HOP..][..N_FFT],
+          &buf[(base + 7.min(last)) * HOP..][..N_FFT],
+        ];
+        self.fft.power_windowed_f32(fs, &self.window, &mut re, &mut im, &mut power);
+        ops::mel_filter8_f32(&self.weights, &self.spans, &power, chunk, count);
+        ops::ln_add_inplace(chunk, LOG_EPS);
       }
     }
-
-    mel
   }
 }
 
