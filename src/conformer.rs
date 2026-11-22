@@ -210,7 +210,11 @@ impl Block {
       }
     };
     let dw_b = if c.bias { f32s("conv.depthwise.bias", &[d])? } else { vec![0.0; d] };
-    let dw = gpu.channels(&f32s("conv.depthwise.weight", &[c.kernel, 1, d])?, &dw_b)?;
+    // `[d][kernel]` in the file, `[kernel][d]` here so lanes read consecutive weights.
+    let w = f32s("conv.depthwise.weight", &[c.kernel, 1, d])?;
+    let taps: Vec<f32> =
+      (0..c.kernel).flat_map(|k| w.iter().skip(k).step_by(c.kernel).copied()).collect();
+    let dw = gpu.channels(&taps, &dw_b)?;
     Ok(Self {
       norm_ff1: norm("norm_ff1")?,
       ff1: [linear(&["ff1.linear1"], &[d, f])?, linear(&["ff1.linear2"], &[f, d])?],
@@ -253,7 +257,7 @@ impl Block {
 
     p.layer_norm(x, &self.norm_conv, y, t, d, None);
     p.gemm(y, &self.pw1, &b.qk, t, Epilogue::Bias);
-    p.conv_glu(&b.qk, &self.dw, c.kernel, &self.conv_norm, c.conv_norm, y, t, d);
+    p.conv_glu(&b.qk, &b.h, &self.dw, c.kernel, &self.conv_norm, c.conv_norm, y, t, d);
     p.gemm(y, &self.pw2, x, t, Epilogue::Residual(1.0));
 
     p.layer_norm(x, &self.norm_ff2, y, t, d, None);

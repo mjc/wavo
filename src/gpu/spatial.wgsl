@@ -80,6 +80,7 @@ fn first_depthwise(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocati
     let a6 = w0[6u * p.ch + c];
     let a7 = w0[7u * p.ch + c];
     let a8 = w0[8u * p.ch + c];
+    let bias0 = b0[c];
     var acc = b[c];
     for (var i = 0u; i < 3u; i++) {
       // First conv's row plus the padding; wraps for row −1, so the check fails.
@@ -88,7 +89,7 @@ fn first_depthwise(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocati
         let fi = 2u * wg.x + j;
         if (ti >= 1u && ti <= t1 && fi >= 1u && fi <= f1) {
           let o = 14u * i + 2u * j;
-          var v = b0[c];
+          var v = bias0;
           v += a0 * x7[o];
           v += a1 * x7[o + 1u];
           v += a2 * x7[o + 2u];
@@ -109,11 +110,20 @@ fn first_depthwise(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocati
 @group(0) @binding(0) var<storage, read> fl_x: array<f32>;
 @group(0) @binding(1) var<storage, read_write> fl_y: array<f32>;
 
-// [t][f][ch] to [t][ch·f]: y[t][c·f + j] = x[t][j][c]. One workgroup per row t.
-@compute @workgroup_size(256)
-fn flatten(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_index) lid: u32) {
-  let n = p.f * p.ch;
-  for (var e = lid; e < n; e += 256u) {
-    fl_y[wg.x * n + e] = fl_x[wg.x * n + (e % p.f) * p.ch + e / p.f];
+// [t][f][ch] to [t][ch·f]: y[t][c·f + j] = x[t][j][c]. 16×16 shared tile for coalesced I/O.
+var<workgroup> flat_tile: array<f32, 272>;
+
+@compute @workgroup_size(16, 16)
+fn flatten(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_id) lid: vec3<u32>) {
+  let j = wg.x * 16u + lid.y;
+  let c = wg.y * 16u + lid.x;
+  if (j < p.f && c < p.ch) {
+    flat_tile[lid.x * 17u + lid.y] = fl_x[(wg.z * p.f + j) * p.ch + c];
+  }
+  workgroupBarrier();
+  let j2 = wg.x * 16u + lid.x;
+  let c2 = wg.y * 16u + lid.y;
+  if (j2 < p.f && c2 < p.ch) {
+    fl_y[(wg.z * p.ch + c2) * p.f + j2] = flat_tile[lid.y * 17u + lid.x];
   }
 }

@@ -1,13 +1,16 @@
 // Copyright (c) vladkens | MIT License | https://github.com/vladkens/wavo
 // Row-wise and convolution kernels over time-major [t][ch] F32 activations.
 
+// Whether conv_glu runs LayerNorm (true) or a per-channel affine x·g + b (false).
+override LAYER_NORM: bool = true;
+
 // One immediate struct for all kernels: naga sizes a module's immediates from its first one.
 struct Params {
   t: u32,
   ch: u32,
   head_dim: u32,
   scale: f32,
-  // conv_glu: the depthwise kernel size, and 1 for LayerNorm or 0 for the affine x·g + b.
+  // conv_glu: the depthwise kernel size; rotary: neox (1) or normal (0).
   kernel: u32,
   layer_norm: u32,
   // im2col: the conv's stride and padding (and `kernel`).
@@ -21,18 +24,27 @@ var<workgroup> red: array<f32, 256>;
 // One row of up to 1024 channels.
 var<workgroup> row: array<f32, 1024>;
 
-// Sum (or max) over a 256-thread workgroup. subgroup.wgsl has the fast version, which the decoder's
-// LayerNorm uses.
-fn reduce(v: f32, lid: u32, is_max: bool) -> f32 {
+// Sum or max over a 256-thread workgroup. subgroup.wgsl has the fast versions.
+fn reduce_sum(v: f32, lid: u32) -> f32 {
   red[lid] = v;
   workgroupBarrier();
   for (var s = 128u; s > 0u; s >>= 1u) {
     if (lid < s) {
-      if (is_max) {
-        red[lid] = max(red[lid], red[lid + s]);
-      } else {
-        red[lid] += red[lid + s];
-      }
+      red[lid] += red[lid + s];
+    }
+    workgroupBarrier();
+  }
+  let r = red[0];
+  workgroupBarrier();
+  return r;
+}
+
+fn reduce_max(v: f32, lid: u32) -> f32 {
+  red[lid] = v;
+  workgroupBarrier();
+  for (var s = 128u; s > 0u; s >>= 1u) {
+    if (lid < s) {
+      red[lid] = max(red[lid], red[lid + s]);
     }
     workgroupBarrier();
   }
@@ -60,13 +72,13 @@ fn layer_norm(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_in
   for (var i = lid; i < p.ch; i += 256u) {
     s += norm_x[base + i];
   }
-  let mean = reduce(s, lid, false) / f32(p.ch);
+  let mean = reduce_sum(s, lid) / f32(p.ch);
   var q = 0.0;
   for (var i = lid; i < p.ch; i += 256u) {
     let d = norm_x[base + i] - mean;
     q += d * d;
   }
-  let rstd = inverseSqrt(reduce(q, lid, false) / f32(p.ch) + 1e-5);
+  let rstd = inverseSqrt(reduce_sum(q, lid) / f32(p.ch) + 1e-5);
   for (var i = lid; i < p.ch; i += 256u) {
     let v = (norm_x[base + i] - mean) * rstd * norm_g[i] + norm_b[i];
     norm_y[base + i] = v;
@@ -118,9 +130,40 @@ fn im2col(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_index)
   col_y[i * width + e] = v;
 }
 
-// Conformer conv module between the pointwise convs, one workgroup per frame: GLU (first half ·
-// sigmoid(second half)) of h [t][2·ch], depthwise conv (odd kernel, centred, weight [ch][kernel])
-// plus bias, LayerNorm over channels or a per-channel affine, SiLU.
+// GLU over h [t][2·ch] into y [t][ch]: y[t][c] = h[t][c] / (1 + exp(-h[t][ch + c])).
+
+@group(0) @binding(0) var<storage, read> glu_h: array<f32>;
+@group(0) @binding(1) var<storage, read_write> glu_y: array<f32>;
+
+@compute @workgroup_size(256)
+fn glu(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_index) lid: u32) {
+  let i = wg.x * 256u + lid;
+  let c4 = p.ch / 4u;
+  if (i < c4) {
+    let c = i * 4u;
+    let b0 = wg.y * 2u * p.ch + c;
+    let b1 = b0 + p.ch;
+    let x = vec4(glu_h[b0], glu_h[b0 + 1u], glu_h[b0 + 2u], glu_h[b0 + 3u]);
+    let g = vec4(glu_h[b1], glu_h[b1 + 1u], glu_h[b1 + 2u], glu_h[b1 + 3u]);
+    let y = x / (vec4(1.0) + exp(-g));
+    let o = wg.y * p.ch + c;
+    glu_y[o] = y.x;
+    glu_y[o + 1u] = y.y;
+    glu_y[o + 2u] = y.z;
+    glu_y[o + 3u] = y.w;
+  }
+  if (wg.x == 0u) {
+    let c = c4 * 4u + lid;
+    if (c < p.ch) {
+      let base = wg.y * 2u * p.ch + c;
+      glu_y[wg.y * p.ch + c] = glu_h[base] / (1.0 + exp(-glu_h[base + p.ch]));
+    }
+  }
+}
+
+// Conformer conv module between the pointwise convs, one workgroup per frame: depthwise conv
+// over GLU output h [t][ch] (odd kernel, centred, weight [kernel][ch]) plus bias, LayerNorm over
+// channels or a per-channel affine, SiLU.
 
 @group(0) @binding(0) var<storage, read> conv_h: array<f32>;
 @group(0) @binding(1) var<storage, read> conv_w: array<f32>;
@@ -140,26 +183,29 @@ fn conv_glu(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_inde
       // Source frame plus the padding.
       let src = t + k;
       if (src >= pad && src - pad < p.t) {
-        let base = (src - pad) * 2u * p.ch;
-        acc += conv_w[i * p.kernel + k] * conv_h[base + i] / (1.0 + exp(-conv_h[base + p.ch + i]));
+        acc += conv_w[k * p.ch + i] * conv_h[(src - pad) * p.ch + i];
       }
     }
-    row[i] = acc;
-    s += acc;
-  }
-  let mean = reduce(s, lid, false) / f32(p.ch);
-  var q = 0.0;
-  for (var i = lid; i < p.ch; i += 256u) {
-    let d = row[i] - mean;
-    q += d * d;
-  }
-  let rstd = inverseSqrt(reduce(q, lid, false) / f32(p.ch) + 1e-5);
-  for (var i = lid; i < p.ch; i += 256u) {
-    var y = row[i] * conv_g[i] + conv_beta[i];
-    if (p.layer_norm != 0u) {
-      y = (row[i] - mean) * rstd * conv_g[i] + conv_beta[i];
+    if (LAYER_NORM) {
+      row[i] = acc;
+      s += acc;
+    } else {
+      let y = acc * conv_g[i] + conv_beta[i];
+      conv_y[t * p.ch + i] = y / (1.0 + exp(-y));
     }
-    conv_y[t * p.ch + i] = y / (1.0 + exp(-y));
+  }
+  if (LAYER_NORM) {
+    let mean = reduce_sum(s, lid) / f32(p.ch);
+    var q = 0.0;
+    for (var i = lid; i < p.ch; i += 256u) {
+      let d = row[i] - mean;
+      q += d * d;
+    }
+    let rstd = inverseSqrt(reduce_sum(q, lid) / f32(p.ch) + 1e-5);
+    for (var i = lid; i < p.ch; i += 256u) {
+      let y = (row[i] - mean) * rstd * conv_g[i] + conv_beta[i];
+      conv_y[t * p.ch + i] = y / (1.0 + exp(-y));
+    }
   }
 }
 
@@ -175,14 +221,14 @@ fn softmax(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_index
   for (var j = lid; j < p.t; j += 256u) {
     mx = max(mx, sm_s[base + j]);
   }
-  mx = reduce(mx, lid, true);
+  mx = reduce_max(mx, lid);
   var sum = 0.0;
   for (var j = lid; j < p.t; j += 256u) {
     let e = exp(sm_s[base + j] - mx);
     sm_s[base + j] = e;
     sum += e;
   }
-  let inv = 1.0 / reduce(sum, lid, false);
+  let inv = 1.0 / reduce_sum(sum, lid);
   for (var j = lid; j < p.t; j += 256u) {
     sm_s[base + j] *= inv;
   }
@@ -214,29 +260,79 @@ fn rotary(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_index)
   rp_x[o2] = x.x * cs.y + x.y * cs.x;
 }
 
-// GroupNorm with one group, in place over x [t][ch] as one workgroup: the mean and variance of all
-// t·ch values, then (x − mean)/√(var + eps) · w[c] + b[c], eps in p.scale.
+// GroupNorm with one group, in place over x [t][ch], split across up to 64 workgroups:
+// `group_norm_stats` writes per-workgroup sum and sum of squares into `part` [128]; `group_norm`
+// reduces them, computes mean and variance = E[x²] − mean², and normalizes.
 
 @group(0) @binding(0) var<storage, read_write> gn_x: array<f32>;
+@group(0) @binding(1) var<storage, read_write> gns_part: array<f32>;
 @group(0) @binding(1) var<storage, read> gn_w: array<f32>;
 @group(0) @binding(2) var<storage, read> gn_b: array<f32>;
+@group(0) @binding(3) var<storage, read> gn_part: array<f32>;
 
 @compute @workgroup_size(256)
-fn group_norm(@builtin(local_invocation_index) lid: u32) {
+fn group_norm_stats(
+  @builtin(workgroup_id) wg: vec3<u32>,
+  @builtin(num_workgroups) num_wgs: vec3<u32>,
+  @builtin(local_invocation_index) lid: u32,
+) {
   let n = p.t * p.ch;
+  let n4 = n / 4u;
+  let gid = wg.x * 256u + lid;
   var s = 0.0;
-  for (var i = lid; i < n; i += 256u) {
-    s += gn_x[i];
-  }
-  let mean = reduce(s, lid, false) / f32(n);
   var q = 0.0;
-  for (var i = lid; i < n; i += 256u) {
-    let d = gn_x[i] - mean;
-    q += d * d;
+  for (var i = gid; i < n4; i += num_wgs.x * 256u) {
+    let k = i * 4u;
+    let v = vec4(gn_x[k], gn_x[k + 1u], gn_x[k + 2u], gn_x[k + 3u]);
+    s += v.x + v.y + v.z + v.w;
+    q += dot(v, v);
   }
-  let rstd = 1.0 / sqrt(reduce(q, lid, false) / f32(n) + p.scale);
-  for (var i = lid; i < n; i += 256u) {
-    gn_x[i] = (gn_x[i] - mean) * rstd * gn_w[i % p.ch] + gn_b[i % p.ch];
+  if (wg.x == 0u) {
+    for (var i = n4 * 4u + lid; i < n; i += 256u) {
+      let v = gn_x[i];
+      s += v;
+      q += v * v;
+    }
+  }
+  s = reduce_sum(s, lid);
+  q = reduce_sum(q, lid);
+  if (lid == 0u) {
+    gns_part[wg.x] = s;
+    gns_part[64u + wg.x] = q;
+  }
+}
+
+@compute @workgroup_size(256)
+fn group_norm(
+  @builtin(workgroup_id) wg: vec3<u32>,
+  @builtin(num_workgroups) num_wgs: vec3<u32>,
+  @builtin(local_invocation_index) lid: u32,
+) {
+  let s = reduce_sum(select(0.0, gn_part[lid], lid < num_wgs.x), lid);
+  let q = reduce_sum(select(0.0, gn_part[64u + lid], lid < num_wgs.x), lid);
+  let n = p.t * p.ch;
+  let mean = s / f32(n);
+  let rstd = inverseSqrt(max(q / f32(n) - mean * mean, 0.0) + p.scale);
+  let gid = wg.x * 256u + lid;
+  if (p.ch % 4u == 0u) {
+    let n4 = n / 4u;
+    for (var i = gid; i < n4; i += num_wgs.x * 256u) {
+      let k = i * 4u;
+      let c = k % p.ch;
+      let x = vec4(gn_x[k], gn_x[k + 1u], gn_x[k + 2u], gn_x[k + 3u]);
+      let w = vec4(gn_w[c], gn_w[c + 1u], gn_w[c + 2u], gn_w[c + 3u]);
+      let b = vec4(gn_b[c], gn_b[c + 1u], gn_b[c + 2u], gn_b[c + 3u]);
+      let y = (x - mean) * rstd * w + b;
+      gn_x[k] = y.x;
+      gn_x[k + 1u] = y.y;
+      gn_x[k + 2u] = y.z;
+      gn_x[k + 3u] = y.w;
+    }
+  } else {
+    for (var i = gid; i < n; i += num_wgs.x * 256u) {
+      let c = i % p.ch;
+      gn_x[i] = (gn_x[i] - mean) * rstd * gn_w[c] + gn_b[c];
+    }
   }
 }
 
@@ -264,8 +360,8 @@ fn relu(@builtin(global_invocation_id) id: vec3<u32>) {
   }
 }
 
-// The index of the largest of x[0..p.t], the lowest one on a tie, as the bits of am_out[0]: the
-// maximum, then the largest −i where it occurs (exact in f32 below 2^24).
+// The index of the largest of x[0..p.t], the lowest one on a tie, as the bits of am_out[0],
+// reduced in one pass over x.
 
 @group(0) @binding(0) var<storage, read> am_x: array<f32>;
 @group(0) @binding(1) var<storage, read_write> am_out: array<u32>;
@@ -273,17 +369,30 @@ fn relu(@builtin(global_invocation_id) id: vec3<u32>) {
 @compute @workgroup_size(256)
 fn argmax(@builtin(local_invocation_index) lid: u32) {
   var mx = -3.0e38;
+  var idx = 0u;
   for (var i = lid; i < p.t; i += 256u) {
-    mx = max(mx, am_x[i]);
+    let v = am_x[i];
+    if (v > mx) {
+      mx = v;
+      idx = i;
+    }
   }
-  mx = reduce(mx, lid, true);
-  var first = -3.0e38;
-  for (var i = lid; i < p.t; i += 256u) {
-    first = select(first, max(first, -f32(i)), am_x[i] == mx);
+  red[lid] = mx;
+  row[lid] = bitcast<f32>(idx);
+  workgroupBarrier();
+  for (var s = 128u; s > 0u; s >>= 1u) {
+    if (lid < s) {
+      let b = red[lid + s];
+      let ib = bitcast<u32>(row[lid + s]);
+      if (b > red[lid] || (b == red[lid] && ib < bitcast<u32>(row[lid]))) {
+        red[lid] = b;
+        row[lid] = bitcast<f32>(ib);
+      }
+    }
+    workgroupBarrier();
   }
-  first = reduce(first, lid, true);
   if (lid == 0u) {
-    am_out[0] = u32(-first);
+    am_out[0] = bitcast<u32>(row[0]);
   }
 }
 
