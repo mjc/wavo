@@ -22,6 +22,7 @@ struct Params {
   uint offset;
   // Q4 and Q5 conv rows shorter than `k`. 0 means the stored row is already `k` wide.
   uint src_k;
+  uint split;
 };
 
 constant constexpr int ROWS = 128;
@@ -150,13 +151,14 @@ kernel void gemm(constant Params &p [[buffer(0)]], device half *a [[buffer(1)]],
                  ushort lane [[thread_index_in_threadgroup]]) {
   threadgroup half sw[COLS * KS];
   const int k = p.k, m0 = tg.y * ROWS, n0 = tg.x * COLS;
+  const int m_off = (p.split > 0 && n0 >= int(p.split)) ? int(p.m) : 0;
   matmul2d<matmul2d_descriptor(ROWS, COLS, static_cast<int>(dynamic_extent), false, true, false,
                                matmul2d_descriptor::mode::multiply_accumulate),
            execution_simdgroups<4>>
       mm;
-  // A K step of a's rows m0.., and the staged W.
+  // A K step of a's rows m0 + m_off.., and the staged W.
   const int rows = p.m - m0;
-  auto ta = tensor(a + m0 * k, dextents<int32_t, 2>(KS, rows), array<int, 2>({1, k}));
+  auto ta = tensor(a + (m0 + m_off) * k, dextents<int32_t, 2>(KS, rows), array<int, 2>({1, k}));
   auto tw = tensor(sw, dextents<int32_t, 2>(KS, COLS), array<int, 2>({1, KS}));
   auto ct = mm.get_destination_cooperative_tensor<decltype(ta), decltype(tw), float>();
   for (uint16_t i = 0; i < ct.get_capacity(); i++) {
@@ -210,7 +212,7 @@ kernel void gemm(constant Params &p [[buffer(0)]], device half *a [[buffer(1)]],
       }
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
-    ta = tensor(a + m0 * k + k0, dextents<int32_t, 2>(KS, rows), array<int, 2>({1, k}));
+    ta = tensor(a + (m0 + m_off) * k + k0, dextents<int32_t, 2>(KS, rows), array<int, 2>({1, k}));
     mm.run(ta, tw, ct);
     threadgroup_barrier(mem_flags::mem_threadgroup);
   }

@@ -35,6 +35,7 @@ struct Params {
   // Q4 and Q5 conv rows shorter than `k`: the file's blocks use this stride, and columns from
   // here to `k` are zero. 0 means the stored row is already `k` wide.
   src_k: u32,
+  split: u32,
 }
 
 var<immediate> p: Params;
@@ -239,13 +240,13 @@ fn q5k_4(x: u32) -> vec4<f32> {
   return codes * s.x - s.y;
 }
 
-// Stages a[m0 + i / (KS / 4)][k0 + i % (KS / 4) · 4 ..+4].
-fn stage_a(m0: u32, k0: u32, i: u32) {
+// Stages a[m0 + m_off + i / (KS / 4)][k0 + i % (KS / 4) · 4 ..+4].
+fn stage_a(m0: u32, k0: u32, i: u32, m_off: u32) {
   let r = i / (KS / 4u);
   let kk = i % (KS / 4u) * 4u;
   var v = vec4<f32>(0.0);
   if (m0 + r < p.m) {
-    v = a[((m0 + r) * p.k + k0 + kk) / 4u];
+    v = a[((m0 + m_off + r) * p.k + k0 + kk) / 4u];
   }
   let o = (kk / F * ROWS + r) * F + kk % F;
   tile[o] = f16(v.x);
@@ -324,6 +325,7 @@ fn gemm(
   }
   let n0 = wg.x * 8u * F;
   let m0 = wg.y * ROWS;
+  let m_off = select(0u, p.m, p.split > 0u && n0 >= p.split);
   // This subgroup's quadrant: rows sr..sr + ROWS / 2, columns sc..sc + 4F of the tile.
   let sr = sg / 2u * ROWS / 2u;
   let sc = sg % 2u * 4u * F;
@@ -347,10 +349,10 @@ fn gemm(
   for (var k0 = 0u; k0 < p.k; k0 += KS) {
     // Each thread stages a vec4 per 128 of a and of W. The first ones stay out of the loops: with
     // them inside, GigaAM on 4.5 s took 3% longer on an M2.
-    stage_a(m0, k0, lane);
+    stage_a(m0, k0, lane, m_off);
     stage_w(n0, k0, lane);
     for (var j = 1u; j < AT / 512u; j++) {
-      stage_a(m0, k0, lane + j * 128u);
+      stage_a(m0, k0, lane + j * 128u, m_off);
     }
     for (var j = 1u; j < F * KS / 64u; j++) {
       stage_w(n0, k0, lane + j * 128u);

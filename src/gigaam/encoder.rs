@@ -102,9 +102,9 @@ impl Encoder {
       // Also the im2col columns of both convs: frames rows of 5·d, 2·frames rows of 5·mels.
       h: gpu.buffer(frames * c.d_ff.max(5 * d).max(10 * self.mels)),
       // Also the first conv's output: 2·frames rows of d.
-      qk: gpu.buffer(frames * 2 * d),
+      qk: gpu.buffer(frames * 3 * d),
       s: gpu.buffer(gpu.scores_len(frames, c.heads, hd, false)),
-      yr: gpu.buffer(frames * d),
+      yr: gpu.buffer(frames * 2 * d),
       pos: gpu.upload(&super::rope(frames, hd, self.theta))?,
     };
     Ok(Arena {

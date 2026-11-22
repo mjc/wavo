@@ -89,15 +89,13 @@ GigaAM:
 1. Attention: q fragments in registers in a kernel specialized for head_dim 48 (only constant
    loop bounds were tried). Its softmax (~17 of 50 ms on ru-long before the output moved to
    registers) ran 32 subgroup reductions per 64-key block; re-profile first.
-2. q·k and v projections as one GEMM (concatenated weights, one A buffer holding `yr | y`): one
-   dispatch less per block and more workgroups at small M.
-3. Q8_0 prepacked in fragment order: low priority, W traffic is not the GEMM's limit.
-4. Decoder: `Wx · embed[token]` depends only on the token, so a per-call cache would skip half of
+2. Q8_0 prepacked in fragment order: low priority, W traffic is not the GEMM's limit.
+3. Decoder: `Wx · embed[token]` depends only on the token, so a per-call cache would skip half of
    the LSTM step (~68 µs) for repeated tokens. On Parakeet V2 it was within noise.
-5. Short recordings: under 2 s (24% of real dictation) wavo's call costs ~1 ms (5%) more than the
+4. Short recordings: under 2 s (24% of real dictation) wavo's call costs ~1 ms (5%) more than the
    reference's, at 2–5 s (37%) the same. At T ≤ 64 frames (2.5 s) FFN down has 12–24 workgroups,
    under two per GPU core. Profile a 1–2 s clip first; candidates are split-K or a 16-row tile at
-   small M, item 2, and fixed CPU costs per call.
+   small M and fixed CPU costs per call.
 
 Parakeet: conv_glu's depthwise taps as [tap][ch] (≤ 2% of GPU time, shared with GigaAM); GEMM tile
 shapes at M = 138 (1.5 vs 1.8 TFLOP/s at M = 442 before the f16 64×64 GEMM; re-profile first).
@@ -200,6 +198,16 @@ Each entry sits under its topic, newest first: date, model, what was tried, the 
 two numbers (A/B/A, warm median unless stated), kept or rejected and why.
 
 ### GEMM
+
+- 2026-11-21, GigaAM, `q·k` and `v` fused into one `qkv` GEMM (`gemm_split` with `split = 2·d`
+  over `[yr; y]`, stacked `[W_q; W_k; W_v]` keeping Q8_0/F16/F32 storage and zero extra FLOPs):
+  GPU dispatches per call drop 262 → 246 on `gigaam-v3` (16 layers) and 390 → 366 on
+  `gigaam-multilingual` (24 layers; also 16/24 fewer `cast` dispatches on the tensor tier), and
+  CPU Conformer `gemm` calls drop 128 → 112 on `gigaam-v3`. Apple M1 was heavily loaded during
+  A/B/A (load avg 12–17, A1 vs A2 varied >2×: GPU `ru-short` 251.6 / 503.8 / 568.7, `ru-long`
+  889.0 / 881.3 / 1284.9, CPU `ru-short` 897.1 / 1258.6 / 1600.7, `ru-long` 2211.7 / 2238.8 /
+  1762.4 ms); needs a quiet rerun for wall-time deltas. All 10 GigaAM GPU/CPU tests and all 4
+  local GPU kernel tiers (`portable`, `portable-32`, `portable-cpu`, `matrix8`) pass exact. Kept.
 
 - 2026-11-19, Whisper Q5_K, Apple M1: cache `q4k_dm` in a private scale/minimum pair keyed
   by the absolute group of 32 in `gemm_fast.wgsl`. At ROWS=64 each thread reuses it over four

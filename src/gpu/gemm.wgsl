@@ -35,6 +35,8 @@ struct Params {
   // Q4 and Q5 conv rows shorter than `k`: the file's blocks use this stride, and columns from
   // here to `k` are zero. 0 means the stored row is already `k` wide.
   src_k: u32,
+  // With split > 0, columns from `split` on read `a` from row `m` on (`[a0; a1]`).
+  split: u32,
 }
 
 var<immediate> p: Params;
@@ -363,17 +365,17 @@ struct Fetch {
   w3: vec4<u32>,
 }
 
-// Thread lid's share of the K step from k0: a rows m0 + lid / 8 (and + 32) at quad lid % 8, W rows
-// from n0 + 4·(lid / 8) at the quad lid % 8.
-fn fetch(m0: u32, n0: u32, k0: u32, lid: u32) -> Fetch {
+// Thread lid's share of the K step from k0: a rows m0 + m_off + lid / 8 (and + 32) at quad
+// lid % 8, W rows from n0 + 4·(lid / 8) at the quad lid % 8.
+fn fetch(m0: u32, n0: u32, k0: u32, lid: u32, m_off: u32) -> Fetch {
   var f: Fetch;
   let r = m0 + lid / 8u;
   let k = k0 + 4u * (lid % 8u);
   if (r < p.m) {
-    f.a0 = half4(a4[(r * p.k + k) / 4u]);
+    f.a0 = half4(a4[((r + m_off) * p.k + k) / 4u]);
   }
   if (ROWS == 64u && r + 32u < p.m) {
-    f.a1 = half4(a4[((r + 32u) * p.k + k) / 4u]);
+    f.a1 = half4(a4[((r + 32u + m_off) * p.k + k) / 4u]);
   }
   // Column quad lid/8. A 64-column tile has 16 quads; the other threads only load a.
   if (lid / 8u < COLS / 4u) {
@@ -394,6 +396,7 @@ fn fetch(m0: u32, n0: u32, k0: u32, lid: u32) -> Fetch {
 fn gemm(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_index) lid: u32) {
   let n0 = wg.x * COLS;
   let m0 = wg.y * ROWS;
+  let m_off = select(0u, p.m, p.split > 0u && n0 >= p.split);
   let lane = lid % 64u;
   let tx = lane % 8u + 8u * ((lid / 64u) % 2u);
   let ty = lane / 8u + 8u * (lid / 128u);
@@ -407,7 +410,7 @@ fn gemm(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_index) l
   var c31: vec4<f32>;
   let r = lid / 8u;
   let kq = 4u * (lid % 8u);
-  var f = fetch(m0, n0, 0u, lid);
+  var f = fetch(m0, n0, 0u, lid, m_off);
   for (var k0 = 0u; k0 < p.k; k0 += 32u) {
     at[r * 9u + kq / 4u] = f.a0;
     if (ROWS == 64u) {
@@ -426,7 +429,7 @@ fn gemm(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_index) l
       wt16[(kq + 3u) * stride + r] = vec2(pack2x16float(vec2(x0.w, x1.w)), pack2x16float(vec2(x2.w, x3.w)));
     }
     if (k0 + 32u < p.k) {
-      f = fetch(m0, n0, k0 + 32u, lid);
+      f = fetch(m0, n0, k0 + 32u, lid, m_off);
     }
     workgroupBarrier();
     for (var kq = 0u; kq < 8u; kq++) {

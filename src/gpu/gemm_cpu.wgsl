@@ -21,6 +21,7 @@ fn store16(m: u32, n0: u32, acc: vec4<f32>) {
 fn gemm64(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_index) lid: u32) {
   let n0 = wg.x * 64u;
   let m0 = wg.y * 64u;
+  let m_off = select(0u, p.m, p.split > 0u && n0 >= p.split);
   let tx = lid % 16u;
   let ty = lid / 16u;
   var acc0: vec4<f32>;
@@ -33,7 +34,7 @@ fn gemm64(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_index)
       let r = e / 32u;
       var v = 0.0;
       if (m0 + r < p.m) {
-        v = a[(m0 + r) * p.k + k0 + e % 32u];
+        v = a[(m0 + m_off + r) * p.k + k0 + e % 32u];
       }
       at64[r * S + e % 32u] = to_half(v);
     }
