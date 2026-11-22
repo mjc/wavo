@@ -124,29 +124,56 @@ impl Linear {
 
 /// `c = epilogue(a·Wᵀ + b)` for `m` rows of `a` `[m][k]` into `c` `[m][n]`.
 pub fn gemm(a: &[f32], l: &Linear, c: &mut [f32], m: usize, epilogue: Epilogue) {
+  gemm_split(a, &[], usize::MAX, l, c, m, epilogue);
+}
+
+/// As [`gemm`], reading `a1` instead of `a0` for output columns from `split` on (`split` a multiple
+/// of `NR`).
+pub fn gemm_split(
+  a0: &[f32],
+  a1: &[f32],
+  split: usize,
+  l: &Linear,
+  c: &mut [f32],
+  m: usize,
+  epilogue: Epilogue,
+) {
   let k = l.k;
+  let has_split = split < l.n;
+  debug_assert!(!has_split || split.is_multiple_of(NR));
+  let a_rows = if has_split { 2 * m } else { m };
   #[cfg(target_arch = "x86_64")]
   if let Weights::Q8(q8) = &l.w
     && let Some(vnni) = super::x86::vnni()
   {
-    let (q, d) = (&mut vec![0; m * k], &mut vec![0.0; m * k / 32]);
+    let (q, d) = (&mut vec![0; a_rows * k], &mut vec![0.0; a_rows * k / 32]);
     let rows = m.div_ceil(4 * super::threads());
-    let parts =
-      a[..m * k].chunks(rows * k).zip(q.chunks_mut(rows * k)).zip(d.chunks_mut(rows * k / 32));
-    // SAFETY: the CPU has AVX-VNNI.
-    par_each(parts, || (), |_, ((a, q), d)| unsafe { x86::quantize(a, q, d) });
+    let (q0, q1) = q.split_at_mut(m * k);
+    let (d0, d1) = d.split_at_mut(m * k / 32);
+    let parts0 =
+      a0[..m * k].chunks(rows * k).zip(q0.chunks_mut(rows * k)).zip(d0.chunks_mut(rows * k / 32));
+    if has_split {
+      let parts1 =
+        a1[..m * k].chunks(rows * k).zip(q1.chunks_mut(rows * k)).zip(d1.chunks_mut(rows * k / 32));
+      // SAFETY: the CPU has AVX-VNNI.
+      par_each(parts0.chain(parts1), || (), |_, ((a, q), d)| unsafe { x86::quantize(a, q, d) });
+    } else {
+      // SAFETY: the CPU has AVX-VNNI.
+      par_each(parts0, || (), |_, ((a, q), d)| unsafe { x86::quantize(a, q, d) });
+    }
     let (aq, ad) = (&*q, &*d);
     let (kq, kd) = (k * NR, k / 32 * NR);
     return jobs(
       l,
       c,
       m,
+      split,
       epilogue,
       2 * kq + 4 * kd,
       |panels| (vec![0; panels * kq], vec![0.0; panels * kd]),
       |(q, d), i, p| x86::pack(q8, l.n, p, &mut q[i * kq..][..kq], &mut d[i * kd..][..kd]),
-      |(q, d), i, row, last| {
-        let at = |r: usize| (row + r).min(last - 1);
+      |(q, d), i, row, last, m_off| {
+        let at = |r: usize| m_off + (row + r).min(last - 1);
         let a = std::array::from_fn(|r| &aq[at(r) * k..][..k]);
         let ad = std::array::from_fn(|r| &ad[at(r) * k / 32..][..k / 32]);
         let (q, d) = (&q[i * kq..][..kq], &d[i * kd..][..kd]);
@@ -160,18 +187,30 @@ pub fn gemm(a: &[f32], l: &Linear, c: &mut [f32], m: usize, epilogue: Epilogue) 
       },
     );
   }
-  let a: Vec<f32> = a[..m * k].iter().map(|&x| to_half(x)).collect();
+  let a: Vec<f32> = if has_split {
+    let mut out = Vec::with_capacity(a_rows * k);
+    out.extend(a0[..m * k].iter().map(|&x| to_half(x)));
+    out.extend(a1[..m * k].iter().map(|&x| to_half(x)));
+    out
+  } else {
+    a0[..m * k].iter().map(|&x| to_half(x)).collect()
+  };
   let kb = k * NR;
   jobs(
     l,
     c,
     m,
+    split,
     epilogue,
     4 * kb,
     |panels| (vec![0.0; panels * kb], vec![0.0; k]),
     |(b, wide), i, p| l.pack(p, &mut b[i * kb..][..kb], wide),
-    |(b, _), i, row, last| {
-      tile(std::array::from_fn(|r| &a[(row + r).min(last - 1) * k..][..k]), &b[i * kb..][..kb], k)
+    |(b, _), i, row, last, m_off| {
+      tile(
+        std::array::from_fn(|r| &a[(m_off + (row + r).min(last - 1)) * k..][..k]),
+        &b[i * kb..][..kb],
+        k,
+      )
     },
   );
 }
@@ -229,11 +268,12 @@ fn jobs<S>(
   l: &Linear,
   c: &mut [f32],
   m: usize,
+  split: usize,
   epilogue: Epilogue,
   bytes: usize,
   scratch: impl Fn(usize) -> S + Sync,
   pack: impl Fn(&mut S, usize, usize) + Sync,
-  tile: impl Fn(&S, usize, usize, usize) -> [[f32; NR]; MR] + Sync,
+  tile: impl Fn(&S, usize, usize, usize, usize) -> [[f32; NR]; MR] + Sync,
 ) {
   let n = l.n;
   let panels = n.div_ceil(NR);
@@ -256,7 +296,8 @@ fn jobs<S>(
       let (r0, r1) = (s * rows, ((s + 1) * rows).min(m));
       for row in (r0..r1).step_by(MR) {
         for (i, p) in ps.clone().enumerate() {
-          let acc = tile(buf, i, row, r1);
+          let m_off = if NR * p >= split { m } else { 0 };
+          let acc = tile(buf, i, row, r1, m_off);
           let cols = NR * p..(NR * p + NR).min(n);
           // SAFETY: jobs write disjoint tiles of `c`, rows r0..r1 of their panels' columns.
           unsafe {
@@ -599,6 +640,27 @@ mod tests {
       for (i, (c, w)) in c.iter().zip(&want).enumerate() {
         let want = 1.0 + 0.5 * (w + bias[i % n]);
         assert!((c - want).abs() <= 1e-4 * want.abs().max(1.0), "{ty:?} {i}: {c} vs {want}");
+      }
+    }
+  }
+
+  #[test]
+  fn gemm_split_matches_dot() {
+    let (k, split, n, m) = (64, 16, 40, 13);
+    let v: Vec<f32> = (0..n * k).map(|i| (i * 7919 % 31) as f32 / 8.0 - 15.0 / 8.0).collect();
+    let f32s: Vec<u8> = v.iter().flat_map(|v| v.to_le_bytes()).collect();
+    let a0: Vec<f32> = (0..m * k).map(|i| (i * 31 % 17) as f32 / 8.0 - 1.0).collect();
+    let a1: Vec<f32> = (0..m * k).map(|i| (i * 19 % 13) as f32 / 8.0 - 0.5).collect();
+    let bias: Vec<f32> = (0..n).map(|i| i as f32 / 4.0).collect();
+    let g = Gguf::with_tensors(&[("w", &[k, n], Type::F32, &f32s)]);
+    let l = super::Linear::new(&[g.tensor("w", &[k, n]).unwrap()], bias.clone()).unwrap();
+    let mut c = vec![0.0; m * n];
+    super::gemm_split(&a0, &a1, split, &l, &mut c, m, Epilogue::Bias);
+    for r in 0..m {
+      for j in 0..n {
+        let a = if j >= split { &a1[r * k..][..k] } else { &a0[r * k..][..k] };
+        let want = crate::cpu::dot(a, &v[j * k..][..k]) + bias[j];
+        assert!((c[r * n + j] - want).abs() <= 1e-4 * want.abs().max(1.0), "{r},{j}");
       }
     }
   }

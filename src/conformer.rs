@@ -54,6 +54,9 @@ impl Config {
     if !d.is_multiple_of(heads) || d > 1024 || hd > 128 || !hd.is_multiple_of(2) {
       bail!("unsupported attention shape: d_model {d}, {heads} heads");
     }
+    if matches!(cfg.attention, Attention::Rotary) && !d.is_multiple_of(64) {
+      bail!("rotary attention requires d_model to be a multiple of 64, got {d}");
+    }
     if cfg.kernel.is_multiple_of(2) {
       bail!("conv kernel {}: only odd kernels are supported", cfg.kernel);
     }
@@ -73,13 +76,13 @@ pub struct Buffers {
   pub y: Buffer,
   /// FFN hidden `[t][d_ff]`; also v for rotary attention.
   pub h: Buffer,
-  /// Attention projections, `[t][q | k]` (rotary) or `[t][q + u | k | v | q + v]` (relative);
+  /// Attention projections, `[t][q | k | v]` (rotary) or `[t][q + u | k | v | q + v]` (relative);
   /// also the pointwise1 output `[t][2·d]`.
   pub qk: Buffer,
   /// Attention scores: `Gpu::scores_len` floats.
   pub s: Buffer,
-  /// Rotary: the normalized rows rotated `[t][d]`. Relative: the projected positions
-  /// `[pos_rows(t) + 64][d]`.
+  /// Rotary: the rotated and unrotated normalized rows `[yr; y]` (`[2·t][d]`). Relative: the
+  /// projected positions `[pos_rows(t) + 64][d]`.
   pub yr: Buffer,
   /// Rotary: per frame head_dim / 2 cosines, then as many sines. Relative: the sinusoidal position
   /// table `[pos_rows(t)][d]` (row r is position t + 15 − r).
@@ -169,8 +172,8 @@ struct Block {
 }
 
 enum Mhsa {
-  /// `linear_q` stacked over `linear_k`: both take the rotated input.
-  Rotary { qk: Linear, v: Linear },
+  /// `[q | k | v]`: `q` and `k` take the rotated input, `v` the unrotated one.
+  Rotary { qkv: Linear },
   /// `[q | k | v]` with biases `[pos_bias_u | 0 | 0]` and q again with `pos_bias_v`, and
   /// `linear_pos`.
   Relative { qkv: Linear, pos: Linear },
@@ -188,10 +191,9 @@ impl Block {
       gpu.channels(&f32s(&format!("{n}.weight"), &[d])?, &f32s(&format!("{n}.bias"), &[d])?)
     };
     let mhsa = match c.attention {
-      Attention::Rotary => Mhsa::Rotary {
-        qk: linear(&["attn.linear_q", "attn.linear_k"], &[d, d])?,
-        v: linear(&["attn.linear_v"], &[d, d])?,
-      },
+      Attention::Rotary => {
+        Mhsa::Rotary { qkv: linear(&["attn.linear_q", "attn.linear_k", "attn.linear_v"], &[d, d])? }
+      }
       Attention::Relative => {
         let w = ["q", "k", "v"].map(|n| g.tensor(&p(&format!("attn.linear_{n}.weight")), &[d, d]));
         let uv = |n: &str| f32s(&format!("attn.pos_bias_{n}"), &[c.head_dim(), c.heads]);
@@ -236,11 +238,10 @@ impl Block {
     p.gemm(&b.h, &self.ff1[1], x, t, Epilogue::Residual(0.5));
 
     match &self.mhsa {
-      Mhsa::Rotary { qk, v } => {
+      Mhsa::Rotary { qkv } => {
         p.layer_norm(x, &self.norm_attn, y, t, d, Some((&b.pos, &b.yr, hd)));
-        p.gemm(&b.yr, qk, &b.qk, t, Epilogue::Bias);
-        p.gemm(y, v, &b.h, t, Epilogue::Bias);
-        p.attention(&b.qk, Some(&b.h), None, &b.s, y, t, c.heads, hd);
+        p.gemm_split(&b.yr, qkv, &b.qk, t, Epilogue::Bias, 2 * d);
+        p.attention(&b.qk, None, None, &b.s, y, t, c.heads, hd);
       }
       Mhsa::Relative { qkv, pos } => {
         p.layer_norm(x, &self.norm_attn, y, t, d, None);
