@@ -351,6 +351,24 @@ fn compile_fast(device: &wgpu::Device, f: usize) -> Option<FastPipelines> {
   (errors == 0).then_some((gemm, kernels))
 }
 
+/// Compiles `attention.wgsl`'s `flash` and `relative` with subgroup shuffle reductions; `None` if
+/// either fails validation.
+fn compile_subgroup_attention(device: &wgpu::Device) -> Option<[Pipeline; 2]> {
+  let scopes = [wgpu::ErrorFilter::Internal, wgpu::ErrorFilter::Validation]
+    .map(|f| device.push_error_scope(f));
+  let source = swap_fns(include_str!("attention.wgsl"), include_str!("subgroup.wgsl"))
+    .replace(
+      "@builtin(local_invocation_index) lid: u32,",
+      "@builtin(local_invocation_index) lid: u32,\n  @builtin(subgroup_size) sg_size: u32,",
+    )
+    .replace("probe_reduce(l.xy, lid, 0u)", "probe_reduce(l.xy, lid, sg_size)");
+  let attention = module(device, &source);
+  let pipelines =
+    [pipeline(device, &attention, "flash", &[]), pipeline(device, &attention, "relative", &[])];
+  let errors = scopes.into_iter().rev().filter_map(|s| pollster::block_on(s.pop())).count();
+  (errors == 0).then_some(pipelines)
+}
+
 /// Kernels for one decoder token: `gemv` and `embed` per weight type, `attend`, `combine`, `pack`
 /// and, with the fast tier, a LayerNorm of one row. With the fast tier their reductions are
 /// subgroup.wgsl's.
@@ -469,14 +487,20 @@ impl Gpu {
     let info = Device::new(&adapter.get_info(), Kernels::Portable);
     let portable = matches!(forced, Some(Forced::Portable(_)));
     let size = if fast && !portable { fast_size(&adapter) } else { None };
-    let fast = size.is_some();
+    let use_fast = size.is_some();
     let tensor = size == Some(8) && tensor_gpu(&adapter) && forced != Some(Forced::Matrix8);
     let cpu = adapter.get_info().device_type == wgpu::DeviceType::Cpu;
+    let subgroups = fast
+      && !cpu
+      && adapter.features().contains(wgpu::Features::SUBGROUP)
+      && adapter.get_info().subgroup_max_size >= 8;
     let mappable = adapter.get_info().device_type == wgpu::DeviceType::IntegratedGpu
       && adapter.features().contains(wgpu::Features::MAPPABLE_PRIMARY_BUFFERS);
     let mut features = wgpu::Features::IMMEDIATES;
-    if fast {
+    if use_fast {
       features |= COOP;
+    } else if subgroups {
+      features |= wgpu::Features::SUBGROUP;
     }
     if mappable {
       features |= wgpu::Features::MAPPABLE_PRIMARY_BUFFERS;
@@ -495,7 +519,7 @@ impl Gpu {
         ..Default::default()
       },
       // SAFETY: cooperative matrices are only used by the bundled kernels, after a probe.
-      experimental_features: if fast {
+      experimental_features: if use_fast {
         unsafe { wgpu::ExperimentalFeatures::enabled() }
       } else {
         wgpu::ExperimentalFeatures::disabled()
@@ -512,10 +536,12 @@ impl Gpu {
     device.set_device_lost_callback(move |_, message| fail(&f, format!("device lost: {message}")));
 
     // The fast kernels compile on a second thread meanwhile.
-    let (kernels, (compiled, tensor)) = std::thread::scope(|s| {
+    let (kernels, (compiled, tensor, sg_attn)) = std::thread::scope(|s| {
       let compiled = s.spawn(|| {
         let fast = size.and_then(|f| compile_fast(&device, f));
-        (fast, if tensor { compile_tensor(&device) } else { None })
+        let tensor = if tensor { compile_tensor(&device) } else { None };
+        let sg_attn = if subgroups { compile_subgroup_attention(&device) } else { None };
+        (fast, tensor, sg_attn)
       });
       let tile = match (forced, size, cpu) {
         (Some(Forced::Portable(tile)), ..) => tile,
@@ -554,8 +580,13 @@ impl Gpu {
       failure,
       halves: Mutex::new(None),
     };
-    if let (Some(size), Some(compiled)) = (size, compiled) {
-      gpu.fast = gpu.probe(size, compiled);
+    if let Some([flash, relative]) = gpu.probe_all(size, compiled, sg_attn) {
+      if let Some(flash) = flash {
+        gpu.kernels.flash = flash;
+      }
+      if let Some(relative) = relative {
+        gpu.kernels.relative = relative;
+      }
     }
     gpu.fast.tensor = tensor;
     if gpu.fast.tensor.is_some() && !gpu.probe_tensor() {
@@ -616,20 +647,85 @@ impl Gpu {
   /// Keeps each fast kernel whose probe reports its subgroup layout. With all params zero a
   /// kernel sees an empty problem and writes its layout, `subgroups` of 32 lanes, to its output.
   /// The probes run in one submission; a device error turns them all off.
+  #[cfg(test)]
   fn probe(&self, size: usize, compiled: FastPipelines) -> Fast {
+    self.probe_fast(size, compiled, None).0
+  }
+
+  /// Probes `compiled` fast kernels and optional subgroup `flash`/`relative` pipelines in one
+  /// submission, setting `self.fast` and returning any passing subgroup attention pipelines.
+  fn probe_all(
+    &mut self,
+    size: Option<usize>,
+    compiled: Option<FastPipelines>,
+    sg_attn: Option<[Pipeline; 2]>,
+  ) -> Option<[Option<Pipeline>; 2]> {
+    let (fast, sg) = match (size, compiled) {
+      (Some(size), Some(compiled)) => self.probe_fast(size, compiled, sg_attn),
+      _ => (Fast::default(), sg_attn.map(|sg| self.probe_sg(sg))),
+    };
+    self.fast = fast;
+    sg
+  }
+
+  fn probe_sg(&self, [flash, relative]: [Pipeline; 2]) -> [Option<Pipeline>; 2] {
+    let specs = [(Some(flash), 3, 2, 7, &[1.0][..]), (Some(relative), 3, 2, 7, &[1.0][..])];
+    let mut kept = self.run_probes(specs);
+    [kept.next().flatten(), kept.next().flatten()]
+  }
+
+  fn probe_fast(
+    &self,
+    size: usize,
+    compiled: FastPipelines,
+    sg_attn: Option<[Pipeline; 2]>,
+  ) -> (Fast, Option<[Option<Pipeline>; 2]>) {
     let (gemm, [layer_norm, conv_glu, attention, relative]) = compiled;
-    // Per kernel: bindings, the output's, params and subgroups.
-    let mut probes: Vec<_> = gemm.into_iter().map(|k| (Some(k), 5, 2, 6, 4.0)).collect();
-    probes.extend([
-      (layer_norm, 6, 3, 4, 4.0),
-      (conv_glu, 6, 5, 6, 4.0),
-      (attention, 3, 2, 7, 4.0),
-      (relative, 4, 3, 8, 1.0),
+    // Per kernel: bindings, the output's, params and expected prefix.
+    let mut specs: Vec<_> =
+      gemm.into_iter().map(|k| (Some(k), 5, 2, 6, &[32.0, 4.0][..])).collect();
+    specs.extend([
+      (layer_norm, 6, 3, 4, &[32.0, 4.0][..]),
+      (conv_glu, 6, 5, 6, &[32.0, 4.0][..]),
+      (attention, 3, 2, 7, &[32.0, 4.0][..]),
+      (relative, 4, 3, 8, &[32.0, 1.0][..]),
     ]);
-    let read = self.readback(2 * probes.len());
+    let has_sg = sg_attn.is_some();
+    if let Some([flash_sg, rel_sg]) = sg_attn {
+      specs.push((Some(flash_sg), 3, 2, 7, &[1.0][..]));
+      specs.push((Some(rel_sg), 3, 2, 7, &[1.0][..]));
+    }
+    let mut kept = self.run_probes(specs);
+    let mut next = || kept.next().flatten();
+    // All six GEMMs are taken before any is checked, so the kernels after them stay in place.
+    let gemm: Vec<_> = (0..6).map(|_| next()).collect();
+    let gemm: Option<Vec<_>> = gemm.into_iter().collect();
+    let (layer_norm, conv_glu, attention, relative) = (next(), next(), next(), next());
+    let sg = has_sg.then(|| [next(), next()]);
+    let fast = Fast {
+      size: if gemm.is_some() { size } else { 0 },
+      gemm,
+      layer_norm,
+      conv_glu,
+      attention_size: if attention.is_some() { size } else { 0 },
+      attention,
+      relative,
+      tensor: None,
+    };
+    (fast, sg)
+  }
+
+  /// Dispatches each present pipeline with zeroed params in one submission, keeping those whose
+  /// output starts with `want`.
+  fn run_probes(
+    &self,
+    specs: impl IntoIterator<Item = (Option<Pipeline>, usize, usize, usize, &'static [f32])>,
+  ) -> impl Iterator<Item = Option<Pipeline>> {
+    let specs: Vec<_> = specs.into_iter().collect();
+    let read = self.readback(2 * specs.len());
     let mut groups = Vec::new();
     let mut p = Pass::new(self, &mut groups, 0);
-    let outs: Vec<Buffer> = (probes.iter())
+    let outs: Vec<Buffer> = (specs.iter())
       .map(|(k, bindings, out, params, _)| {
         let mut buffers: Vec<Buffer> = (0..*bindings).map(|_| self.buffer(16)).collect();
         if let Some(k) = k {
@@ -651,24 +747,10 @@ impl Gpu {
       && self.failure.lock().unwrap_or_else(PoisonError::into_inner).take().is_none();
     let range = mapped.then(|| read.slice(..).get_mapped_range().ok()).flatten();
     let got: Vec<f32> = range.map(|r| bytemuck::cast_slice(&r).to_vec()).unwrap_or_default();
-    let mut kept = (probes.into_iter().enumerate()).map(|(i, (k, .., subgroups))| {
-      k.filter(|_| got.get(2 * i..2 * i + 2) == Some(&[32.0, subgroups][..]))
-    });
-    let mut next = || kept.next().flatten();
-    // All six GEMMs are taken before any is checked, so the kernels after them stay in place.
-    let gemm: Vec<_> = (0..6).map(|_| next()).collect();
-    let gemm: Option<Vec<_>> = gemm.into_iter().collect();
-    let (layer_norm, conv_glu, attention, relative) = (next(), next(), next(), next());
-    Fast {
-      size: if gemm.is_some() { size } else { 0 },
-      gemm,
-      layer_norm,
-      conv_glu,
-      attention_size: if attention.is_some() { size } else { 0 },
-      attention,
-      relative,
-      tensor: None,
-    }
+    specs
+      .into_iter()
+      .enumerate()
+      .map(move |(i, (k, .., want))| k.filter(|_| got.get(2 * i..2 * i + want.len()) == Some(want)))
   }
 
   /// An uninitialized storage buffer of `len` f32s.
@@ -1696,13 +1778,16 @@ mod tests {
       let ops = [&f.layer_norm, &f.conv_glu, &f.attention, &f.relative];
       // With 16×16 matrices only the GEMM and flash attention.
       let adapter = adapter().unwrap();
-      if let Some(size) = fast_size(&adapter) {
+      let forced = Forced::parse(std::env::var("WAVO_KERNELS").ok().as_deref()).ok().flatten();
+      if !matches!(forced, Some(Forced::Portable(_)))
+        && let Some(size) = fast_size(&adapter)
+      {
         let want = [size == 8, size == 8, true, size == 8];
         assert!(
           f.gemm.is_some() && ops.iter().zip(want).all(|(k, w)| k.is_some() == w),
           "a fast kernel failed its probe"
         );
-        let tensor = size == 8 && tensor_gpu(&adapter);
+        let tensor = size == 8 && tensor_gpu(&adapter) && forced != Some(Forced::Matrix8);
         assert_eq!(f.tensor.is_some(), tensor, "the tensor GEMM failed its probe");
       }
       [Gpu::new(false, None).unwrap(), fast]
@@ -2161,8 +2246,11 @@ mod tests {
 
   #[test]
   fn attention() {
-    // head_dim 56: the flash kernel's last 8 columns stay out.
-    for (t, hd) in [(37usize, 48), (100, 48), (100, 56), (5, 36), (70, 52), (100, 64), (40, 80)] {
+    // head_dim 28: portable flash with subgroups on gpus()[1]; 56: the fast flash's last 8 stay
+    // out.
+    for (t, hd) in
+      [(37usize, 28), (37, 48), (100, 48), (100, 56), (5, 36), (70, 52), (100, 64), (40, 80)]
+    {
       let heads = 2;
       let d = heads * hd;
       // The fast path reads rows up to t rounded up to 64 (8×8: and 4 floats past the last v row).
