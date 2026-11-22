@@ -97,7 +97,7 @@ GigaAM:
    under two per GPU core. Profile a 1–2 s clip first; candidates are split-K or a 16-row tile at
    small M and fixed CPU costs per call.
 
-Parakeet: conv_glu's depthwise taps as [tap][ch] (≤ 2% of GPU time, shared with GigaAM); GEMM tile
+Parakeet: GEMM tile
 shapes at M = 138 (1.5 vs 1.8 TFLOP/s at M = 442 before the f16 64×64 GEMM; re-profile first).
 FluidAudio on Core ML's GPU path (F16 activations, 6-bit weights) runs V3 end to end in 8–15%
 less time than wavo (jfk 134 vs 145, dots 372 vs 437 ms); its encoder alone takes 103 ms per 15 s
@@ -113,8 +113,7 @@ folding into the gemvs didn't save.
 
 GPUs without cooperative matrices, open in [the Linux plan](plans/20261010-linux.md) (Tasks 5 and
 7): the portable GEMM is ~90% of Parakeet's GPU time on the N100 (~120 GFLOP/s of its ~290 peak in
-FFN up); F16 math in it; subgroup LayerNorm and conv_glu at any subgroup width, apart from the
-cooperative-matrix gate; Parakeet's fixed cost per call (`first_depthwise`, frames padded to 64);
+FFN up); F16 math in it; Parakeet's fixed cost per call (`first_depthwise`, frames padded to 64);
 with the person's approval, since it changes arithmetic, an int8 GEMM (`dot4I8Packed`) on Q8_0
 activations as the reference's CPU path does.
 
@@ -525,6 +524,28 @@ two numbers (A/B/A, warm median unless stated), kept or rejected and why.
   phase attention saved 47 of 111 ms: the serial phase between barriers was the cost.
 
 ### Other encoder kernels and dispatches
+
+- 2026-11-21, all models, Apple M1 (Metal):
+  - Split `subgroup.wgsl`'s `reduce` into `reduce_sum` and `reduce_max` (supporting any subgroup
+    width and reducing partials in one subgroup when they fit) and enabled `subgroup.wgsl` in
+    `ops.wgsl` and `decode.wgsl` on any non-DX12 adapter with `Features::SUBGROUP` (off on
+    `WAVO_KERNELS=portable`).
+  - `conv_glu`: transposed `dw.w` to `[kernel][ch]` at load, specialized `LAYER_NORM` so
+    `ConvNorm::Affine` skips reduction/barriers/shared row, added a `vec4` `glu` pass into `b.h`
+    so GLU runs once per frame, and dropped `ops_fast.wgsl`'s 4-row `conv_glu` (its 16 KB shared
+    `rows` tile lost to 256-thread subgroup `ops.wgsl` across all shapes: GigaAM `845×768` min
+    2.893 → 0.569, `275×768` 1.027 → 0.216, Parakeet `442×1024` 0.402 → 0.282 ms/call).
+  - Fused `ops_fast.wgsl` `layer_norm` RoPE output into one `(i, i + half)` pass with `vec4`
+    non-RoPE loads (Parakeet `442×1024` min 0.197 → 0.145, GigaAM RoPE `845×768` 0.202 → 0.130
+    ms/call), split `ops.wgsl` `group_norm` across up to 64 workgroups with `vec4` (`1100×288` min
+    1.900 → 0.063 ms), made `argmax` single-pass (`32768` min 0.061 → 0.034 ms), hoisted `b0[c]`
+    in `first_depthwise`, and tiled `flatten` into 16×16 shared tiles (`442×10×256` min 0.351 →
+    0.323 ms).
+  - Quiet A/B/A against `085e861` (`wavo bench --backend gpu`, warm median ms): `gigaam-v3`
+    `ru-long` 385.7 / 370.8 / 399.9 (min 368.8 / 367.3 / 371.5), `parakeet-v3` `dots` 654.8 /
+    627.5 / 633.8 (min 631.6 / 623.2 / 626.5); `gigaam-v3` `ru-short` 142.2 / 139.8 / 138.6 and
+    `parakeet-v3` `jfk` 234.0 / 250.9 / 242.5 within noise. All 27 GPU fixtures exact on all 4
+    `make test-kernels` tiers (`portable`, `portable-32`, `portable-cpu`, `matrix8`). Kept.
 
 - 2026-10-11, all models, Windows RTX 4060: the subgroup LayerNorm and conv_glu next to the 16×16
   GEMM: LayerNorm 5.0 → 8.2 ms on turbo `jfk`, conv_glu 0.89 → 1.16 ms on Parakeet V3 `dots` (GPU

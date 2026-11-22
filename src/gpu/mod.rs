@@ -353,6 +353,8 @@ pub struct Gpu {
   fast: Fast,
   /// Bound for a writable output a dispatch doesn't use, so no writable binding aliases another.
   spare: Buffer,
+  /// Partial sum and sum-of-squares scratch for `Pass::group_norm` (up to 64 workgroups).
+  group_part: Buffer,
   /// One slot per submission of a call, set to the call's number when its work is done. A driver
   /// may cancel a long submission and report success (i915 does after 20 s), which would read
   /// back the previous call's output; a slot without the number makes the call an error instead.
@@ -433,7 +435,9 @@ struct Portable {
   gemm_tile: [usize; 2],
   layer_norm: Pipeline,
   im2col: Pipeline,
-  conv_glu: Pipeline,
+  glu: Pipeline,
+  /// Indexed by `(norm == ConvNorm::LayerNorm) as usize`.
+  conv_glu: [Pipeline; 2],
   flash: Pipeline,
   relative: Pipeline,
   scores: Pipeline,
@@ -443,6 +447,7 @@ struct Portable {
   first_depthwise: Pipeline,
   flatten: Pipeline,
   rope: Pipeline,
+  group_norm_stats: Pipeline,
   group_norm: Pipeline,
   swiglu: Pipeline,
   relu: Pipeline,
@@ -452,15 +457,20 @@ struct Portable {
   gemm_module: wgpu::ShaderModule,
   /// Compiled on first use: only encoder–decoder models need them.
   decoder: OnceLock<Decoder>,
+  /// Whether `ops` and `decode` use `subgroup.wgsl` reductions.
+  subgroup: bool,
 }
 
 impl Portable {
-  fn new(device: &wgpu::Device, gemm_tile: [usize; 2], cpu: bool) -> Self {
+  fn new(device: &wgpu::Device, gemm_tile: [usize; 2], cpu: bool, subgroup: bool) -> Self {
     let gemm = match cpu {
       true => module(device, &[include_str!("gemm.wgsl"), include_str!("gemm_cpu.wgsl")].concat()),
       false => module(device, include_str!("gemm.wgsl")),
     };
-    let ops = module(device, include_str!("ops.wgsl"));
+    let ops = match subgroup {
+      true => module(device, &swap_fns(include_str!("ops.wgsl"), include_str!("subgroup.wgsl"))),
+      false => module(device, include_str!("ops.wgsl")),
+    };
     let attention = module(device, include_str!("attention.wgsl"));
     let spatial = module(device, include_str!("spatial.wgsl"));
     Self {
@@ -483,7 +493,11 @@ impl Portable {
       gemm_tile,
       layer_norm: pipeline(device, &ops, "layer_norm", &[]),
       im2col: pipeline(device, &ops, "im2col", &[]),
-      conv_glu: pipeline(device, &ops, "conv_glu", &[]),
+      glu: pipeline(device, &ops, "glu", &[]),
+      conv_glu: [
+        pipeline(device, &ops, "conv_glu", &[("LAYER_NORM", 0.0)]),
+        pipeline(device, &ops, "conv_glu", &[("LAYER_NORM", 1.0)]),
+      ],
       flash: pipeline(device, &attention, "flash", &[]),
       relative: pipeline(device, &attention, "relative", &[]),
       scores: pipeline(device, &attention, "scores", &[]),
@@ -493,6 +507,7 @@ impl Portable {
       first_depthwise: pipeline(device, &spatial, "first_depthwise", &[]),
       flatten: pipeline(device, &spatial, "flatten", &[]),
       rope: pipeline(device, &ops, "rotary", &[]),
+      group_norm_stats: pipeline(device, &ops, "group_norm_stats", &[]),
       group_norm: pipeline(device, &ops, "group_norm", &[]),
       swiglu: pipeline(device, &ops, "swiglu", &[]),
       relu: pipeline(device, &ops, "relu", &[]),
@@ -501,15 +516,16 @@ impl Portable {
       mark: pipeline(device, &ops, "mark", &[]),
       gemm_module: gemm,
       decoder: OnceLock::new(),
+      subgroup,
     }
   }
 }
 
-/// The fast GEMMs (per weight type 4F- and 8F-row tiles), LayerNorm, conv_glu, flash attention and
-/// relative attention, before their probes. With F = 16 only the GEMM and flash attention (its own
-/// kernel on f16 operands): relative attention needs 8×8 F32 matrices, and on an RTX 4060 the fast
-/// LayerNorm and conv_glu were slower.
-type FastPipelines = (Vec<Pipeline>, [Option<Pipeline>; 4]);
+/// The fast GEMMs (per weight type 4F- and 8F-row tiles), LayerNorm, flash attention and relative
+/// attention, before their probes. With F = 16 only the GEMM and flash attention (its own kernel on
+/// f16 operands): relative attention needs 8×8 F32 matrices, and on an RTX 4060 the fast LayerNorm
+/// was slower.
+type FastPipelines = (Vec<Pipeline>, [Option<Pipeline>; 3]);
 
 /// Compiles the fast kernels for F×F cooperative matrices; `None` if any fails.
 fn compile_fast(device: &wgpu::Device, f: usize) -> Option<FastPipelines> {
@@ -534,14 +550,13 @@ fn compile_fast(device: &wgpu::Device, f: usize) -> Option<FastPipelines> {
     let flash = module(device, include_str!("flash.wgsl"));
     [
       pipeline(device, &ops, "layer_norm", &[]),
-      pipeline(device, &ops, "conv_glu", &[]),
       pipeline(device, &flash, "flash", &[]),
       pipeline(device, &relative, "attention", &[]),
     ]
   });
   let kernels = kernels.map(|k| k.map(Some)).unwrap_or_else(|| {
     let flash = module(device, include_str!("flash_f16.wgsl"));
-    [None, None, Some(pipeline(device, &flash, "flash", &[])), None]
+    [None, Some(pipeline(device, &flash, "flash", &[])), None]
   });
   let errors = scopes.into_iter().rev().filter_map(|s| pollster::block_on(s.pop())).count();
   (errors == 0).then_some((gemm, kernels))
@@ -565,11 +580,10 @@ fn compile_subgroup_attention(device: &wgpu::Device) -> Option<[Pipeline; 2]> {
   (errors == 0).then_some(pipelines)
 }
 
-/// Kernels for one decoder token: `gemv` and `embed` per weight type, `attend`, `combine`, `pack`
-/// and, with the fast tier, a LayerNorm of one row. With the fast tier their reductions are
-/// subgroup.wgsl's.
+/// Kernels for one decoder token: `gemv` and `embed` per weight type, `attend`, `combine` and
+/// `pack`. When `subgroup` is set, `attend` uses subgroup.wgsl. With the fast tier, `gemv` and
+/// `embed` do too.
 struct Decoder {
-  layer_norm: Option<Pipeline>,
   gemv: Vec<Pipeline>,
   embed: Vec<Pipeline>,
   attend: Pipeline,
@@ -583,7 +597,6 @@ struct Fast {
   size: usize,
   gemm: Option<Vec<Pipeline>>,
   layer_norm: Option<Pipeline>,
-  conv_glu: Option<Pipeline>,
   /// Flash attention: `flash.wgsl` (F = 8, head_dim 32..64) or `flash_f16.wgsl` (F = 16,
   /// head_dim ≤ 64), both in steps of 4.
   attention: Option<Pipeline>,
@@ -694,6 +707,10 @@ impl Gpu {
 
     let info = Device::new(&adapter.get_info(), Kernels::Portable);
     let portable = matches!(forced, Some(Forced::Portable(_)));
+    let subgroup = fast
+      && !portable
+      && info.api != Api::Dx12
+      && adapter.features().contains(wgpu::Features::SUBGROUP);
     let size = if fast && !portable { fast_size(&adapter) } else { None };
     let use_fast = size.is_some();
     let tensor = size == Some(8) && tensor_gpu(&adapter) && forced != Some(Forced::Matrix8);
@@ -711,7 +728,7 @@ impl Gpu {
     }
     if use_fast {
       features |= COOP;
-    } else if subgroups {
+    } else if subgroups || subgroup {
       features |= wgpu::Features::SUBGROUP;
     }
     if mappable {
@@ -764,7 +781,7 @@ impl Gpu {
         (_, Some(16), _) => ([128, 32], false),
         _ => ([64, 64], false),
       };
-      (Portable::new(&device, tile, cpu_shader), compiled.join().unwrap())
+      (Portable::new(&device, tile, cpu_shader, subgroup), compiled.join().unwrap())
     });
     let weights = wgpu::BufferUsages::STORAGE
       | if mappable { wgpu::BufferUsages::MAP_WRITE } else { wgpu::BufferUsages::COPY_DST };
@@ -778,6 +795,7 @@ impl Gpu {
     };
     let period = if stamp { queue.get_timestamp_period() } else { 0.0 };
     let spare = buffer(4, wgpu::BufferUsages::STORAGE);
+    let group_part = buffer(128 * 4, wgpu::BufferUsages::STORAGE);
     let marks = buffer(MARKS * 4, wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC);
     let marks_read = buffer(MARKS * 4, wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST);
     let mut gpu = Self {
@@ -788,6 +806,7 @@ impl Gpu {
       kernels,
       fast: Fast::default(),
       spare,
+      group_part,
       marks,
       marks_read,
       calls: AtomicU32::new(0),
@@ -902,7 +921,7 @@ impl Gpu {
     compiled: FastPipelines,
     sg_attn: Option<[Pipeline; 2]>,
   ) -> (Fast, Option<[Option<Pipeline>; 2]>) {
-    let (gemm, [layer_norm, conv_glu, attention, relative]) = compiled;
+    let (gemm, [layer_norm, attention, relative]) = compiled;
     let n_gemm = gemm.len();
     // Per kernel: bindings, the output's, params and the prefix a passing probe writes.
     // The fast GEMM shader's immediate struct is nine words; Q4 and Q5 read `src_k`, GEMM reads
@@ -911,7 +930,6 @@ impl Gpu {
       gemm.into_iter().map(|k| (Some(k), 5, 2, 9, &[32.0, 4.0][..])).collect();
     specs.extend([
       (layer_norm, 6, 3, 4, &[32.0, 4.0][..]),
-      (conv_glu, 6, 5, 6, &[32.0, 4.0][..]),
       (attention, 3, 2, 7, &[32.0, 4.0][..]),
       (relative, 4, 3, 8, &[32.0, 1.0][..]),
     ]);
@@ -925,13 +943,12 @@ impl Gpu {
     // Every GEMM is taken before any is checked, so the kernels after them stay in place.
     let gemm: Vec<_> = (0..n_gemm).map(|_| next()).collect();
     let gemm: Option<Vec<_>> = gemm.into_iter().collect();
-    let (layer_norm, conv_glu, attention, relative) = (next(), next(), next(), next());
+    let (layer_norm, attention, relative) = (next(), next(), next());
     let sg = has_sg.then(|| [next(), next()]);
     let fast = Fast {
       size: if gemm.is_some() { size } else { 0 },
       gemm,
       layer_norm,
-      conv_glu,
       attention_size: if attention.is_some() { size } else { 0 },
       attention,
       relative,
@@ -1343,16 +1360,15 @@ impl Gpu {
     self.kernels.decoder.get_or_init(|| {
       let device = &self.device;
       let fast = self.fast.size != 0;
-      let source =
-        |s: &str| if fast { swap_fns(s, include_str!("subgroup.wgsl")) } else { s.into() };
+      let swap = |use_sg: bool, s: &str| {
+        if use_sg { swap_fns(s, include_str!("subgroup.wgsl")) } else { s.into() }
+      };
       let gemm = match fast {
-        true => &module(device, &source(include_str!("gemm.wgsl"))),
+        true => &module(device, &swap(true, include_str!("gemm.wgsl"))),
         false => &self.kernels.gemm_module,
       };
-      let decode = module(device, &source(include_str!("decode.wgsl")));
-      let ops = fast.then(|| module(device, &source(include_str!("ops.wgsl"))));
+      let decode = module(device, &swap(self.kernels.subgroup, include_str!("decode.wgsl")));
       Decoder {
-        layer_norm: ops.map(|ops| pipeline(device, &ops, "layer_norm", &[])),
         gemv: gemms(device, gemm, "gemv"),
         embed: gemms(device, gemm, "embed"),
         attend: pipeline(device, &decode, "attend", &[]),
@@ -1838,12 +1854,12 @@ impl Forced {
 
   /// Whether the probes left all of the tier in `fast`.
   fn kept(self, fast: &Fast) -> bool {
-    let ops = [&fast.layer_norm, &fast.conv_glu, &fast.attention, &fast.relative];
+    let ops = [&fast.layer_norm, &fast.attention, &fast.relative];
     match self {
       Self::Portable(_) => true,
       _ => {
         fast.gemm.is_some()
-          && ops.iter().all(|k| k.is_some())
+          && ops.into_iter().all(|k| k.is_some())
           && fast.tensor.is_some() == (self == Self::Tensor)
       }
     }
@@ -2220,15 +2236,15 @@ impl<'a> Pass<'a> {
     }
   }
 
-  /// LayerNorm of one row of `cols` from `x` into `y`: the decoder's, with subgroup sums on the
-  /// fast tier.
+  /// LayerNorm of one row of `cols` from `x` into `y`: the decoder's, with subgroup reductions
+  /// when available.
   pub fn layer_norm_row(&mut self, x: &Buffer, n: &Channels, y: &Buffer, cols: usize) {
-    match &self.gpu.decoder().layer_norm {
-      Some(k) => {
-        self.run(k, &[x, &n.w, &n.b, y, x, &self.gpu.spare], &[1, cols as u32, 0], [1, 1, 1])
-      }
-      None => self.layer_norm(x, n, y, 1, cols, None),
-    }
+    self.run(
+      &self.gpu.kernels.layer_norm,
+      &[x, &n.w, &n.b, y, x, &self.gpu.spare],
+      &[1, cols as u32, 0],
+      [1, 1, 1],
+    );
   }
 
   /// `c[offset..]` = `epilogue(a·Wᵀ + b)` for one row `a`, W not rounded to f16.
@@ -2308,12 +2324,14 @@ impl<'a> Pass<'a> {
     self.run(&self.gpu.kernels.im2col, &[x, col], &params, [width.div_ceil(256), rows, 1]);
   }
 
-  /// Conformer conv module between the pointwise convs: GLU, depthwise conv (odd `kernel`,
-  /// centred) + bias, `norm`, SiLU. `h` is `[t][2·ch]`, `y` is `[t][ch]`.
+  /// Conformer conv module between the pointwise convs: GLU (into `scratch` `[t][ch]`), depthwise
+  /// conv (odd `kernel`, centred, weight `[kernel][ch]`) + bias, `norm`, SiLU. `h` is `[t][2·ch]`,
+  /// `y` is `[t][ch]`.
   #[allow(clippy::too_many_arguments)]
   pub fn conv_glu(
     &mut self,
     h: &Buffer,
+    scratch: &Buffer,
     dw: &Channels,
     kernel: usize,
     n: &Channels,
@@ -2323,13 +2341,16 @@ impl<'a> Pass<'a> {
     ch: usize,
   ) {
     let gpu = self.gpu;
-    let buffers = [h, &dw.w, &dw.b, &n.w, &n.b, y];
-    let layer_norm = (norm == ConvNorm::LayerNorm) as u32;
-    let params = [t as u32, ch as u32, 0, 0, kernel as u32, layer_norm];
-    match &gpu.fast.conv_glu {
-      Some(k) => self.run(k, &buffers, &params, [t.div_ceil(4), 1, 1]),
-      None => self.run(&gpu.kernels.conv_glu, &buffers, &params, [t, 1, 1]),
-    }
+    self.run(
+      &gpu.kernels.glu,
+      &[h, scratch],
+      &[t as u32, ch as u32],
+      [(ch / 4).div_ceil(256).max(1), t, 1],
+    );
+    let buffers = [scratch, &dw.w, &dw.b, &n.w, &n.b, y];
+    let ln = (norm == ConvNorm::LayerNorm) as usize;
+    let params = [t as u32, ch as u32, 0, 0, kernel as u32, ln as u32];
+    self.run(&gpu.kernels.conv_glu[ln], &buffers, &params, [t, 1, 1]);
   }
 
   /// Multi-head attention over `qk` `[t][q | k]` and `v` `[t][heads · head_dim]` into `o`, or
@@ -2428,8 +2449,11 @@ impl<'a> Pass<'a> {
   /// GroupNorm with one group, in place over `x` `[t][ch]`: normalized over all its values, then
   /// times `n.w` and plus `n.b` per channel.
   pub fn group_norm(&mut self, x: &Buffer, n: &Channels, t: usize, ch: usize, eps: f32) {
+    let k = &self.gpu.kernels;
     let params = [t as u32, ch as u32, 0, eps.to_bits()];
-    self.run(&self.gpu.kernels.group_norm, &[x, &n.w, &n.b], &params, [1, 1, 1]);
+    let wgs = (t * ch / 4).div_ceil(256).clamp(1, 64);
+    self.run(&k.group_norm_stats, &[x, &self.gpu.group_part], &params, [wgs, 1, 1]);
+    self.run(&k.group_norm, &[x, &n.w, &n.b, &self.gpu.group_part], &params, [wgs, 1, 1]);
   }
 
   /// SwiGLU in place over one row `h` `[x | gate]` of 2·`ch`: `h[..ch]` = SiLU(gate) · x.
@@ -2456,7 +2480,7 @@ impl<'a> Pass<'a> {
   /// `x` `[t][f][ch]` to `y` `[t][ch · f]`, channel-major.
   pub fn flatten(&mut self, x: &Buffer, y: &Buffer, t: usize, f: usize, ch: usize) {
     let k = &self.gpu.kernels.flatten;
-    self.run(k, &[x, y], &[t as u32, f as u32, ch as u32], [t, 1, 1]);
+    self.run(k, &[x, y], &[t as u32, f as u32, ch as u32], [f.div_ceil(16), ch.div_ceil(16), t]);
   }
 }
 
@@ -2477,16 +2501,16 @@ mod tests {
     GPUS.get_or_init(|| {
       let fast = Gpu::new(true, None).unwrap();
       let f = &fast.fast;
-      let ops = [&f.layer_norm, &f.conv_glu, &f.attention, &f.relative];
+      let ops = [&f.layer_norm, &f.attention, &f.relative];
       // With 16×16 matrices only the GEMM and flash attention.
       let adapter = adapter().unwrap();
       let forced = Forced::parse(std::env::var("WAVO_KERNELS").ok().as_deref()).ok().flatten();
       if !matches!(forced, Some(Forced::Portable(_)))
         && let Some(size) = fast_size(&adapter)
       {
-        let want = [size == 8, size == 8, true, size == 8];
+        let want = [size == 8, true, size == 8];
         assert!(
-          f.gemm.is_some() && ops.iter().zip(want).all(|(k, w)| k.is_some() == w),
+          f.gemm.is_some() && ops.into_iter().zip(want).all(|(k, w)| k.is_some() == w),
           "a fast kernel failed its probe"
         );
         let tensor = size == 8 && tensor_gpu(&adapter) && forced != Some(Forced::Matrix8);
@@ -2687,7 +2711,7 @@ mod tests {
     assert!(fast.gemm.is_none() && fast.size == 0);
     // Flash attention keeps its own F, which picks its head sizes.
     assert_eq!(fast.attention_size, if fast.attention.is_some() { size } else { 0 });
-    assert!([fast.layer_norm, fast.conv_glu, fast.attention, fast.relative] == kernels);
+    assert!([fast.layer_norm, fast.attention, fast.relative] == kernels);
   }
 
   #[test]
@@ -3361,11 +3385,18 @@ mod tests {
         ConvNorm::Affine => dw.iter().enumerate().map(|(i, x)| x * g[i % ch] + b[i % ch]).collect(),
       };
       let want: Vec<f32> = want.into_iter().map(silu).collect();
+      let taps: Vec<f32> =
+        (0..kernel).flat_map(|k| w.iter().skip(k).step_by(kernel).copied()).collect();
       for gpu in gpus() {
-        let (n, dw, hb) =
-          (gpu.channels(&g, &b).unwrap(), gpu.channels(&w, &wb).unwrap(), up(gpu, &h));
-        let got =
-          run(gpu, &vec![0.0; t * ch], |p, y| p.conv_glu(&hb, &dw, kernel, &n, norm, y, t, ch));
+        let (n, dw, hb, scratch) = (
+          gpu.channels(&g, &b).unwrap(),
+          gpu.channels(&taps, &wb).unwrap(),
+          up(gpu, &h),
+          gpu.buffer(t * ch),
+        );
+        let got = run(gpu, &vec![0.0; t * ch], |p, y| {
+          p.conv_glu(&hb, &scratch, &dw, kernel, &n, norm, y, t, ch)
+        });
         assert_close(&got, &want);
       }
     }
