@@ -18,6 +18,9 @@ override ROWS: u32 = 64u;
 override COLS: u32 = 128u;
 // 32 k-steps by COLS/4 column quads.
 override WT: u32 = 1024u;
+// Subgroups of 32 threads in `gemv` (workgroup size 32 * GROUPS).
+override GROUPS: u32 = 8u;
+override RED: u32 = 128u * GROUPS;
 
 struct Params {
   m: u32,
@@ -54,7 +57,7 @@ var<immediate> p: Params;
 // two pad bytes). Q5_K uses a 20-byte record: f16 scale, f16 minimum, eight scales, eight
 // minimums. Any buffer for the other types.
 @group(0) @binding(4) var<storage, read> scales: array<u32>;
-// `a` for the GEMM's 16-byte loads.
+// `a` for 16-byte loads in `gemm` and `gemv`.
 @group(0) @binding(0) var<storage, read> a4: array<vec4<f32>>;
 
 // Rounds to the nearest f16, ties to even, by hand: NVIDIA's Vulkan driver folds
@@ -521,7 +524,7 @@ fn dot8(row: u32, j: u32, a0: vec4<f32>, a1: vec4<f32>) -> f32 {
   }
 }
 
-var<workgroup> red: array<f32, 1024>;
+var<workgroup> red: array<f32, RED>;
 
 // The sums of s over each group of 32 threads (lid / 32), for all its threads. subgroup.wgsl has
 // the fast version.
@@ -545,16 +548,17 @@ fn group_sums(s: vec4<f32>, lid: u32) -> vec4<f32> {
   return vec4(red[o - lane], red[o - lane + 32u], red[o - lane + 64u], red[o - lane + 96u]);
 }
 
-// c[offset + n] = epilogue(a·W[n] + bias[n]) for one row of a: 8 groups of 32 threads, 4 rows of W
-// per group, each thread over 8 weights at a time (8 contiguous words per 4 threads and row).
-@compute @workgroup_size(256)
+// c[offset + n] = epilogue(a·W[n] + bias[n]) for one row of a: GROUPS groups of 32 threads, 4
+// rows of W per group, each thread over 8 weights at a time (8 contiguous words per 4 threads and
+// row).
+@compute @workgroup_size(32u * GROUPS)
 fn gemv(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_index) lid: u32) {
   let lane = lid % 32u;
-  let row = (wg.x * 8u + lid / 32u) * 4u;
+  let row = (wg.x * GROUPS + lid / 32u) * 4u;
   var s = vec4(0.0);
   for (var j = lane; j < p.k / 8u; j += 32u) {
-    let a0 = vec4(a[8u * j], a[8u * j + 1u], a[8u * j + 2u], a[8u * j + 3u]);
-    let a1 = vec4(a[8u * j + 4u], a[8u * j + 5u], a[8u * j + 6u], a[8u * j + 7u]);
+    let a0 = a4[2u * j];
+    let a1 = a4[2u * j + 1u];
     s += vec4(dot8(row, j, a0, a1), dot8(row + 1u, j, a0, a1), dot8(row + 2u, j, a0, a1), dot8(row + 3u, j, a0, a1));
   }
   let t = group_sums(s, lid);

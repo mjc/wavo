@@ -581,10 +581,12 @@ fn compile_subgroup_attention(device: &wgpu::Device) -> Option<[Pipeline; 2]> {
 }
 
 /// Kernels for one decoder token: `gemv` and `embed` per weight type, `attend`, `combine` and
-/// `pack`. When `subgroup` is set, `attend` uses subgroup.wgsl. With the fast tier, `gemv` and
-/// `embed` do too.
+/// `pack`. `gemv` has 64-thread workgroups for `cols <= 512` and 256-thread ones otherwise.
+/// When `subgroup` is set, `attend` uses subgroup.wgsl. With the fast tier, `gemv` and `embed` do
+/// too.
 struct Decoder {
-  gemv: Vec<Pipeline>,
+  /// One per weight type: 64-thread workgroups (`l.cols <= 512`), then 256-thread ones.
+  gemv: [Vec<Pipeline>; 2],
   embed: Vec<Pipeline>,
   attend: Pipeline,
   combine: Pipeline,
@@ -1368,8 +1370,13 @@ impl Gpu {
         false => &self.kernels.gemm_module,
       };
       let decode = module(device, &swap(self.kernels.subgroup, include_str!("decode.wgsl")));
+      let gemvs = |groups: f64| {
+        (0..WEIGHT_TYPES)
+          .map(|ty| pipeline(device, gemm, "gemv", &[("WTYPE", ty as f64), ("GROUPS", groups)]))
+          .collect()
+      };
       Decoder {
-        gemv: gemms(device, gemm, "gemv"),
+        gemv: [gemvs(2.0), gemvs(8.0)],
         embed: gemms(device, gemm, "embed"),
         attend: pipeline(device, &decode, "attend", &[]),
         combine: pipeline(device, &decode, "combine", &[]),
@@ -2252,7 +2259,14 @@ impl<'a> Pass<'a> {
     let [mode, alpha] = epilogue.params();
     let params = [1, l.cols as u32, l.k as u32, mode, alpha, 0, offset as u32, l.src_k as u32];
     let buffers = [a, &l.bias, c, &l.weight, l.scales.as_ref().unwrap_or(&l.bias)];
-    self.run(&self.gpu.decoder().gemv[l.ty], &buffers, &params, [l.cols / 32, 1, 1]);
+    // Narrow layers (small d) launch too few 256-thread workgroups to fill the GPU.
+    let (tier, groups) = if l.cols <= 512 { (0, 2) } else { (1, 8) };
+    self.run(
+      &self.gpu.decoder().gemv[tier][l.ty],
+      &buffers,
+      &params,
+      [l.cols / (4 * groups), 1, 1],
+    );
   }
 
   /// `c` = row `ids[i]` of the table `l` + `pos[offset..]` + the table's bias, `l.k` values. `ids`
@@ -3224,8 +3238,9 @@ mod tests {
 
   #[test]
   fn gemv_and_embed() {
-    // 100 rows padded to 128 by `linear`; 288, a multiple of 32, written as they are.
-    for (n, cols) in [(100, 128), (288, 288)] {
+    // 100 rows padded to 128 by `linear`; 288, a multiple of 32, written as they are; 576 takes
+    // the wider workgroup tier.
+    for (n, cols) in [(100, 128), (288, 288), (576, 576)] {
       let k = 96;
       let bias = random(n, 2);
       let a = random(k, 3);
