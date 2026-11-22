@@ -619,7 +619,7 @@ impl Gpu {
   fn probe(&self, size: usize, compiled: FastPipelines) -> Fast {
     let (gemm, [layer_norm, conv_glu, attention, relative]) = compiled;
     // Per kernel: bindings, the output's, params and subgroups.
-    let mut probes: Vec<_> = gemm.into_iter().map(|k| (Some(k), 5, 2, 6, 4.0)).collect();
+    let mut probes: Vec<_> = gemm.into_iter().map(|k| (Some(k), 5, 2, 8, 4.0)).collect();
     probes.extend([
       (layer_norm, 6, 3, 4, 4.0),
       (conv_glu, 6, 5, 6, 4.0),
@@ -1253,7 +1253,7 @@ fn compile_tensor(device: &wgpu::Device) -> Option<TensorGemm> {
     })
   };
   let cast = pipeline("cast", 2, 1, 4);
-  let gemm = names[1..].iter().map(|n| pipeline(n, 5, 2, 24)).collect();
+  let gemm = names[1..].iter().map(|n| pipeline(n, 5, 2, 32)).collect();
   let errors = scopes.into_iter().rev().filter_map(|s| pollster::block_on(s.pop())).count();
   (errors == 0).then_some(TensorGemm { cast, gemm })
 }
@@ -1393,14 +1393,30 @@ impl<'a> Pass<'a> {
 
   /// `c = epilogue(a·Wᵀ + b)` for `m` rows of `a`.
   pub fn gemm(&mut self, a: &Buffer, l: &Linear, c: &Buffer, m: usize, epilogue: Epilogue) {
+    self.gemm_split(a, l, c, m, epilogue, 0);
+  }
+
+  /// As [`Pass::gemm`], reading rows `m..2m` of `a` (`[a0; a1]`) for output columns from `split` on
+  /// when `split > 0` (`split` must be a multiple of 128).
+  pub fn gemm_split(
+    &mut self,
+    a: &Buffer,
+    l: &Linear,
+    c: &Buffer,
+    m: usize,
+    epilogue: Epilogue,
+    split: usize,
+  ) {
+    debug_assert!(split == 0 || split.is_multiple_of(128));
     let gpu = self.gpu;
     let [mode, alpha] = epilogue.params();
-    let params = [m as u32, l.cols as u32, l.k as u32, mode, alpha, l.dual as u32];
+    let params = [m as u32, l.cols as u32, l.k as u32, mode, alpha, l.dual as u32, 0, split as u32];
     // Only Q8_0 reads scales; other types bind the bias in their place.
     let scales = l.scales.as_ref().unwrap_or(&l.bias);
     if let Some(t) = &gpu.fast.tensor {
       // The tensor GEMM reads a as f16 from device memory (k is a multiple of 32 by `linear`).
-      let (h, n4) = (gpu.halves(m * l.k), m * l.k / 4);
+      let rows = if split > 0 { 2 * m } else { m };
+      let (h, n4) = (gpu.halves(rows * l.k), rows * l.k / 4);
       self.run(&t.cast, &[a, &h], &[n4 as u32], [n4.div_ceil(256).min(65535), 1, 1]);
       let size = [l.n / 64, m.div_ceil(128), 1];
       return self.run(&t.gemm[l.ty], &[&h, &l.bias, c, &l.weight, scales], &params, size);
@@ -1425,9 +1441,9 @@ impl<'a> Pass<'a> {
     }
   }
 
-  /// LayerNorm over `rows` rows of `cols` into `y`; with `rope` (a table, `yr`, head_dim) also the
-  /// same with rotary embedding into `yr`. The table holds per position head_dim / 2 cosines
-  /// followed by as many sines.
+  /// LayerNorm over `rows` rows of `cols` into `y`; with `rope` (a table, `yr`, head_dim) it
+  /// writes the rotated rows followed by the normalized rows `[yr; y]` into `yr` instead of `y`.
+  /// The table holds per position head_dim / 2 cosines followed by as many sines.
   pub fn layer_norm(
     &mut self,
     x: &Buffer,
@@ -1945,6 +1961,47 @@ mod tests {
   }
 
   #[test]
+  fn gemm_split() {
+    let (m, k, split, n) = (37, 64, 128, 192);
+    let w = random(n * k, 41);
+    let bias = random(n, 42);
+    let a = random(2 * m * k, 43);
+    let half = |x: &f32| f16::from_f32(*x).to_f32();
+    let f32s: &[u8] = bytemuck::cast_slice(&w);
+    let f16s: Vec<u8> = w.iter().flat_map(|x| f16::from_f32(*x).to_le_bytes()).collect();
+    let q8: Vec<u8> = (w.chunks(32))
+      .flat_map(|block| {
+        let d = block.iter().fold(0f32, |m, x| m.max(x.abs())) / 127.0;
+        let q = block.iter().map(move |x| (x / d).round() as i8 as u8);
+        f16::from_f32(d).to_le_bytes().into_iter().chain(q)
+      })
+      .collect();
+    let ar: Vec<f32> = a.iter().map(half).collect();
+    for (ty, bytes) in [(Type::F32, f32s), (Type::F16, &f16s), (Type::Q8_0, &q8)] {
+      let file = Gguf::with_tensors(&[("w", &[k, n], ty, bytes)]);
+      let t = file.tensor("w", &[k, n]).unwrap();
+      let wf: Vec<f32> = t.to_f32().unwrap().iter().map(half).collect();
+      let want: Vec<f32> = (0..m * n)
+        .map(|i| {
+          let (r, j) = (i / n, i % n);
+          let rr = if j >= split { m + r } else { r };
+          bias[j] + (0..k).map(|x| ar[rr * k + x] * wf[j * k + x]).sum::<f32>()
+        })
+        .collect();
+      for gpu in gpus() {
+        let l = gpu.linear(&[file.tensor("w", &[k, n]).unwrap()], &bias).unwrap();
+        let ab = up(gpu, &a);
+        assert_close(
+          &run(gpu, &vec![0.0; m * n], |p, out| {
+            p.gemm_split(&ab, &l, out, m, Epilogue::Bias, split);
+          }),
+          &want,
+        );
+      }
+    }
+  }
+
+  #[test]
   fn layer_norm_and_rope() {
     let (rows, cols, hd) = (37, 192, 48);
     let x = random(rows * cols, 5);
@@ -1958,6 +2015,7 @@ mod tests {
         if d < half { y[i] * cos - y[i + half] * sin } else { y[i] * cos + y[i - half] * sin }
       })
       .collect();
+    let yr_y: Vec<f32> = yr.iter().chain(&y).copied().collect();
     for gpu in gpus() {
       let n = gpu.channels(&g, &b).unwrap();
       let (xb, rb) = (up(gpu, &x), up(gpu, &rope));
@@ -1966,9 +2024,10 @@ mod tests {
       let got = run(gpu, &zeros[..cols], |p, y| p.layer_norm_row(&xb, &n, y, cols));
       assert_close(&got, &y[..cols]);
       let yb = gpu.buffer(rows * cols);
-      let got =
-        run(gpu, &zeros, |p, yr| p.layer_norm(&xb, &n, &yb, rows, cols, Some((&rb, yr, hd))));
-      assert_close(&got, &yr);
+      let got = run(gpu, &vec![0.0; 2 * rows * cols], |p, yr| {
+        p.layer_norm(&xb, &n, &yb, rows, cols, Some((&rb, yr, hd)));
+      });
+      assert_close(&got, &yr_y);
     }
   }
 

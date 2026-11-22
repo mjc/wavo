@@ -41,9 +41,9 @@ fn reduce(v: f32, lid: u32, is_max: bool) -> f32 {
   return r;
 }
 
-// LayerNorm (eps 1e-5) of row t, one workgroup per row. With head_dim > 0 it also writes the
-// normalized row with rotary embedding: NEOX split-half rotation inside each head, using a
-// [t][cos | sin] table of head_dim / 2 frequencies each.
+// LayerNorm (eps 1e-5) of row t, one workgroup per row. With head_dim > 0 it writes the
+// rotated rows followed by the normalized rows [yr; y] into norm_yr: NEOX split-half rotation
+// inside each head, using a [t][cos | sin] table of head_dim / 2 frequencies each.
 
 @group(0) @binding(0) var<storage, read> norm_x: array<f32>;
 @group(0) @binding(1) var<storage, read> norm_g: array<f32>;
@@ -69,9 +69,10 @@ fn layer_norm(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_in
   let rstd = inverseSqrt(reduce(q, lid, false) / f32(p.ch) + 1e-5);
   for (var i = lid; i < p.ch; i += 256u) {
     let v = (norm_x[base + i] - mean) * rstd * norm_g[i] + norm_b[i];
-    norm_y[base + i] = v;
     if (p.head_dim != 0u) {
       row[i] = v;
+    } else {
+      norm_y[base + i] = v;
     }
   }
   // Before the return: FXC (DX12) rejects a barrier after a return under a loop it deems varying.
@@ -91,6 +92,7 @@ fn layer_norm(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_in
       v += row[i - half] * sn;
     }
     norm_yr[base + i] = v;
+    norm_yr[p.t * p.ch + base + i] = row[i];
   }
 }
 

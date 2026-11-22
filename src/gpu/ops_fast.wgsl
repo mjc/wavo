@@ -15,8 +15,8 @@ struct Params {
 
 var<immediate> p: Params;
 
-// LayerNorm, four rows per workgroup. The rotary output recomputes the normalized partner element
-// instead of exchanging it.
+// LayerNorm, four rows per workgroup. With head_dim > 0 it writes [yr; y] into norm_yr;
+// the rotary output recomputes the normalized partner element instead of exchanging it.
 
 @group(0) @binding(0) var<storage, read> norm_x: array<f32>;
 @group(0) @binding(1) var<storage, read> norm_g: array<f32>;
@@ -62,24 +62,26 @@ fn layer_norm(
   if (r >= p.t) {
     return;
   }
-  for (var i = sl; i < p.ch; i += 32u) {
-    norm_y[t * p.ch + i] = normalized(t, i, st);
-  }
   if (p.head_dim == 0u) {
+    for (var i = sl; i < p.ch; i += 32u) {
+      norm_y[t * p.ch + i] = normalized(t, i, st);
+    }
     return;
   }
   let half = p.head_dim / 2u;
   for (var i = sl; i < p.ch; i += 32u) {
+    let v = normalized(t, i, st);
     let d = i % p.head_dim;
     let f = d % half;
     let sn = rope[t * p.head_dim + half + f];
-    var vr = normalized(t, i, st) * rope[t * p.head_dim + f];
+    var vr = v * rope[t * p.head_dim + f];
     if (d < half) {
       vr -= normalized(t, i + half, st) * sn;
     } else {
       vr += normalized(t, i - half, st) * sn;
     }
     norm_yr[t * p.ch + i] = vr;
+    norm_yr[(p.t + t) * p.ch + i] = v;
   }
 }
 

@@ -2,7 +2,7 @@
 //! The Conformer blocks of `src/conformer.rs` on the CPU, with rotary attention (GigaAM) or
 //! relative positions (Parakeet).
 
-use super::gemm::{Linear, NR, gemm};
+use super::gemm::{Linear, NR, gemm, gemm_split};
 use super::ops::{attention, conv_glu, layer_norm, relative_attention};
 use crate::conformer::{Attention, Config, batch_norm};
 use crate::error::{Result, bail};
@@ -35,8 +35,8 @@ struct Block {
 }
 
 enum Mhsa {
-  /// `linear_q` stacked over `linear_k`: both take the rotated input.
-  Rotary { qk: Linear, v: Linear },
+  /// `[q | k | v]`: `q` and `k` take the rotated input, `v` the unrotated one.
+  Rotary { qkv: Linear },
   /// `[q | k | v]`, `linear_pos`, and the position biases u and v `[heads][head_dim]`.
   Relative { qkv: Linear, pos: Linear, uv: Channels },
 }
@@ -45,9 +45,9 @@ enum Mhsa {
 struct Buffers {
   x: Vec<f32>,
   y: Vec<f32>,
-  /// FFN hidden `[t][d_ff]`; also v (rotary).
+  /// FFN hidden `[t][d_ff]`.
   h: Vec<f32>,
-  /// `[t][q | k]` (rotary) or `[t][q | k | v]` (relative); also the pointwise1 output `[t][2·d]`.
+  /// `[t][q | k | v]` (rotary or relative); also the pointwise1 output `[t][2·d]`.
   qk: Vec<f32>,
   /// Rotary: the normalized rows rotated. Relative: the projected positions `[pos_rows(t)][d]`.
   yr: Vec<f32>,
@@ -72,12 +72,12 @@ impl Conformer {
   pub fn run(&self, x: Vec<f32>, t: usize, pos: &[f32]) -> Vec<f32> {
     let c = &self.cfg;
     let (qk, yr) = match c.attention {
-      Attention::Rotary => (2 * t, t),
+      Attention::Rotary => (3 * t, t),
       Attention::Relative => (3 * t, pos_rows(t)),
     };
     let mut b = Buffers {
       y: vec![0.0; t * c.d],
-      h: vec![0.0; t * c.d_ff.max(c.d)],
+      h: vec![0.0; t * c.d_ff],
       qk: vec![0.0; qk * c.d],
       yr: vec![0.0; yr * c.d],
       x,
@@ -125,10 +125,9 @@ impl Block {
     let w = f32s("conv.depthwise.weight", &[c.kernel, 1, d])?;
     let taps = (0..c.kernel).flat_map(|k| w.iter().skip(k).step_by(c.kernel).copied()).collect();
     let mhsa = match c.attention {
-      Attention::Rotary => Mhsa::Rotary {
-        qk: linear(&["attn.linear_q", "attn.linear_k"], &[d, d])?,
-        v: linear(&["attn.linear_v"], &[d, d])?,
-      },
+      Attention::Rotary => {
+        Mhsa::Rotary { qkv: linear(&["attn.linear_q", "attn.linear_k", "attn.linear_v"], &[d, d])? }
+      }
       Attention::Relative => {
         let uv = |n: &str| f32s(&format!("attn.pos_bias_{n}"), &[c.head_dim(), c.heads]);
         Mhsa::Relative {
@@ -166,13 +165,11 @@ impl Block {
     gemm(h, &self.ff1[1], x, t, Epilogue::Residual(0.5));
 
     match &self.mhsa {
-      Mhsa::Rotary { qk: w, v: wv } => {
-        let (qk, yr) = (&mut qk[..t * 2 * d], &mut yr[..t * d]);
+      Mhsa::Rotary { qkv } => {
+        let (qkv_out, yr) = (&mut qk[..t * 3 * d], &mut yr[..t * d]);
         layer_norm(x, n(&self.norm_attn), y, Some((pos, yr, c.head_dim())));
-        gemm(yr, w, qk, t, Epilogue::Bias);
-        let v = &mut h[..t * d];
-        gemm(y, wv, v, t, Epilogue::Bias);
-        attention(qk, 2 * d, v, d, y, t, c.heads);
+        gemm_split(yr, y, 2 * d, qkv, qkv_out, t, Epilogue::Bias);
+        attention(qkv_out, 3 * d, &qkv_out[2 * d..], 3 * d, y, t, c.heads);
       }
       Mhsa::Relative { qkv, pos: wp, uv } => {
         let (qkv_out, p) = (&mut qk[..t * 3 * d], &mut yr[..pos_rows(t) * d]);
