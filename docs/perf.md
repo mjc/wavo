@@ -198,6 +198,16 @@ two numbers (A/B/A, warm median unless stated), kept or rejected and why.
 
 ### GEMM
 
+- 2026-11-21, Whisper and Moonshine, `gemv` (`gemm.wgsl`): vectorized activation loads via `a4`
+  (`array<vec4<f32>>`) and 64-thread workgroups (`GROUPS=2`, `RED=256`) when `l.cols <= 512`, keeping
+  256 threads (`GROUPS=8`) for wider layers (`d=1280` and vocab heads). Fixed 64- or 128-thread
+  workgroups slowed an isolated `whisper-turbo` `gemv` loop (`2.85–2.87 → 2.92–3.09` ms/tok) while
+  helping small-`d` shapes (`moonshine-tiny` `0.54 → 0.49–0.53`, `whisper-tiny` `0.65–0.66 → 0.62`
+  ms/tok). Apple M1 Metal end-to-end A/B/A (`jfk`; `dots` for Moonshine): `whisper-tiny` `104.1 /
+  100.7 / 101.9` ms (portable `192.7 / 185.1 / 191.8` ms), `moonshine-tiny` `340.6 / 342.8 / 343.5`
+  ms (min `311.5 / 298.4 / 333.8`), `whisper-large-v3-turbo` `1911.1 / 1915.6 / 1913.2` ms. Fixtures
+  exact on default and portable tiers. Kept.
+
 - 2026-11-07, all models, the portable GEMM rounds `a` to f16 as `kernel_mul_mm` does (PR #88):
   without it ivrit he-long gave `החללה` where the fixture has `החלאה`, a near-tie. This reverses
   the rejection of rounding `a` in the 2026-10-09 entry on rounding W below, now that a fixture
