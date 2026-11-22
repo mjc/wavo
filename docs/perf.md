@@ -478,12 +478,12 @@ two numbers (A/B/A, warm median unless stated), kept or rejected and why.
     `group_norm`/`im2col`.
   - Quiet M1 back-to-back A/B against `085e861` (`wavo bench --backend cpu`, warm median ms):
     `whisper-large-v3-turbo` `jfk` 9240 → 4832 (1.91×), `gigaam-v3` `ru-short` 576 → 259 (2.23×),
-    `parakeet-v2` `jfk` 811 → 392 (2.07×), `parakeet-v3` `jfk` 793 → 454 (min 391, 2.03×),
+    `parakeet-v2` `jfk` 811 → 392 (2.07×), `parakeet-v3` `jfk` 793 → 454 (1.75×; min 391),
     `whisper-tiny` `jfk` 268 → 167 (1.60×), `moonshine-tiny` `jfk` 110 → 71 (1.55×); ANE
     `gigaam-v3` `ru-short` 49.4 → 49.2 (first 66.4 → 55.6); Metal `whisper-turbo` `jfk` 1916 → 1921
     (min 1907 → 1902). Ryzen 5 8600G (AVX2+FMA, AVX512-VNNI, 12t) CPU warm median: `gigaam-v3`
     `ru-short` 271 → 173 (1.57×), `ru-long` 748 → 585 (1.28×), `parakeet-v2` 408 → 320 (1.28×),
-    `parakeet-v3` 455 → 338 (1.34×), `whisper-tiny` 180 → 145 (1.24×), `moonshine-tiny` 91 → 62
+    `parakeet-v3` 455 → 338 (1.35×), `whisper-tiny` 180 → 145 (1.24×), `moonshine-tiny` 91 → 62
     (1.47×), `whisper-turbo` 3531 → 3190 (1.11×). Ryzen 9 5950X (AVX2+FMA, 32t) CPU warm median:
     `gigaam-v3` `ru-short` 1710 → 355 (4.82×), `ru-long` 3615 → 867 (4.17×), `parakeet-v2` 1747 →
     817 (2.14×), `parakeet-v3` 2002 → 739 (2.71×), `whisper-tiny` 535 → 317 (1.69×),

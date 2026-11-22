@@ -817,6 +817,9 @@ mod tests {
         while !pool.done.waiting.load(Ordering::Acquire) {
           std::thread::yield_now();
         }
+        // Caller holds `done.lock` while publishing `waiting`; acquiring it proves it entered
+        // `wait`.
+        drop(pool.done.lock.lock().unwrap());
         blocked.store(true, Ordering::Relaxed);
       }
     });
