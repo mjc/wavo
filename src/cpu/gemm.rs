@@ -150,22 +150,16 @@ pub fn gemm_split(
     let rows = m.div_ceil(4 * super::threads());
     let (q0, q1) = q.split_at_mut(m * k);
     let (d0, d1) = d.split_at_mut(m * k / 32);
-    let quant = |src: &[f32], dst_q: &mut [i16], dst_d: &mut [f32]| {
-      src[..m * k]
-        .chunks(rows * k)
-        .zip(dst_q.chunks_mut(rows * k))
-        .zip(dst_d.chunks_mut(rows * k / 32))
-    };
+    let parts0 =
+      a0[..m * k].chunks(rows * k).zip(q0.chunks_mut(rows * k)).zip(d0.chunks_mut(rows * k / 32));
     if has_split {
+      let parts1 =
+        a1[..m * k].chunks(rows * k).zip(q1.chunks_mut(rows * k)).zip(d1.chunks_mut(rows * k / 32));
       // SAFETY: the CPU has AVX-VNNI.
-      par_each(
-        quant(a0, q0, d0).chain(quant(a1, q1, d1)),
-        || (),
-        |_, ((a, q), d)| unsafe { x86::quantize(a, q, d) },
-      );
+      par_each(parts0.chain(parts1), || (), |_, ((a, q), d)| unsafe { x86::quantize(a, q, d) });
     } else {
       // SAFETY: the CPU has AVX-VNNI.
-      par_each(quant(a0, q0, d0), || (), |_, ((a, q), d)| unsafe { x86::quantize(a, q, d) });
+      par_each(parts0, || (), |_, ((a, q), d)| unsafe { x86::quantize(a, q, d) });
     }
     let (aq, ad) = (&*q, &*d);
     let (kq, kd) = (k * NR, k / 32 * NR);
