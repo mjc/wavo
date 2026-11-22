@@ -363,19 +363,11 @@ pub fn gemv(x: &[f32], l: &Linear, c: &mut [f32], epilogue: Epilogue) {
 fn to_half(x: f32) -> f32 {
   let b = x.to_bits();
   let normal = f32::from_bits((b + 0xfff + ((b >> 13) & 1)) & 0xffff_e000);
-  #[cfg(any(target_arch = "aarch64", target_feature = "sse4.1"))]
-  {
-    let sub = (x * 16_777_216.0).round_ties_even() * (1.0 / 16_777_216.0);
-    if x.abs() < f32::from_bits(0x3880_0000) { sub } else { normal }
-  }
-  #[cfg(not(any(target_arch = "aarch64", target_feature = "sse4.1")))]
-  {
-    if x.abs() < f32::from_bits(0x3880_0000) {
-      (x * 16_777_216.0).round_ties_even() * (1.0 / 16_777_216.0)
-    } else {
-      normal
-    }
-  }
+  // For |x| < 2⁻¹⁴, |x|·2²⁴ < 1024; adding and subtracting 2²³ rounds ties-to-even in plain
+  // IEEE-754 arithmetic with no libm `rintf` call on baseline x86_64.
+  let ax = x.abs();
+  let sub = (((ax * 16_777_216.0 + 8_388_608.0) - 8_388_608.0) * (1.0 / 16_777_216.0)).copysign(x);
+  if ax < f32::from_bits(0x3880_0000) { sub } else { normal }
 }
 
 /// Runs a GEMM's jobs over `l`'s panels of `bytes` each: a job packs a group of panels that fits
@@ -589,7 +581,7 @@ fn finish(c: &mut [f32], acc: &[f32], bias: &[f32], epilogue: Epilogue) {
     Epilogue::Bias => c.iter_mut().zip(v).for_each(|(c, v)| *c = v),
     Epilogue::Silu => c.iter_mut().zip(v).for_each(|(c, v)| *c = ops::silu(v)),
     Epilogue::Relu => c.iter_mut().zip(v).for_each(|(c, v)| *c = v.max(0.0)),
-    Epilogue::Residual(alpha) => c.iter_mut().zip(v).for_each(|(c, v)| *c += alpha * v),
+    Epilogue::Residual(alpha) => c.iter_mut().zip(v).for_each(|(c, v)| *c = ops::fma(alpha, v, *c)),
     Epilogue::Gelu => c.iter_mut().zip(v).for_each(|(c, v)| *c = ops::gelu(v)),
     Epilogue::GeluResidual => c.iter_mut().zip(v).for_each(|(c, v)| *c += ops::gelu(v)),
     // As the GPU's: tanh(±10) is ±1 in f32.
@@ -839,16 +831,16 @@ mod neon {
             let q = vcvtnq_s32_f32(vmulq_n_f32(v[half * 4 + j], inv));
             let h = vshrq_n_s32::<8>(vaddq_s32(q, c128));
             let l = vsubq_s32(q, vshlq_n_s32::<8>(h));
-            hs[j] = vmovn_s32(h);
-            ls[j] = vmovn_s32(l);
+            hs[j] = vqmovn_s32(h);
+            ls[j] = vqmovn_s32(l);
           }
           let h8 = vcombine_s8(
-            vmovn_s16(vcombine_s16(hs[0], hs[1])),
-            vmovn_s16(vcombine_s16(hs[2], hs[3])),
+            vqmovn_s16(vcombine_s16(hs[0], hs[1])),
+            vqmovn_s16(vcombine_s16(hs[2], hs[3])),
           );
           let l8 = vcombine_s8(
-            vmovn_s16(vcombine_s16(ls[0], ls[1])),
-            vmovn_s16(vcombine_s16(ls[2], ls[3])),
+            vqmovn_s16(vcombine_s16(ls[0], ls[1])),
+            vqmovn_s16(vcombine_s16(ls[2], ls[3])),
           );
           vst1q_s8(hi.as_mut_ptr().add(half * 16), h8);
           vst1q_s8(lo.as_mut_ptr().add(half * 16), l8);
