@@ -24,3 +24,20 @@ fn reduce(v: f32, lid: u32, is_max: bool) -> f32 {
   workgroupBarrier();
   return t;
 }
+
+fn reduce_at(v: f32, lid: u32, is_max: bool, off: u32) -> f32 {
+  let r = select(subgroupAdd(v), subgroupMax(v), is_max);
+  if (lid % 32u == 0u) {
+    red[off + lid / 32u] = r;
+  }
+  workgroupBarrier();
+  var t = red[off];
+  for (var i = 1u; i < 8u; i++) {
+    if (is_max) {
+      t = max(t, red[off + i]);
+    } else {
+      t += red[off + i];
+    }
+  }
+  return t;
+}

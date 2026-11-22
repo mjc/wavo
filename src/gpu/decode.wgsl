@@ -21,42 +21,41 @@ struct Params {
 
 var<immediate> p: Params;
 
-@group(0) @binding(0) var<storage, read> at_q: array<f32>;
+@group(0) @binding(0) var<storage, read> at_q: array<vec2<f32>>;
 @group(0) @binding(1) var<storage, read> at_kv: array<u32>;
-@group(0) @binding(2) var<storage, read_write> at_part: array<f32>;
+@group(0) @binding(2) var<storage, read_write> at_part: array<vec2<f32>>;
 
 // Keys per workgroup.
 const KEYS: u32 = 256u;
 
-// A key per thread, head_dim up to 128.
-var<workgroup> q: array<f32, 128>;
+// A key per thread, head_dim up to 128. `red` holds two 256-slot reduction regions so consecutive
+// reductions in `attend` use distinct slots and need no trailing barrier.
+var<workgroup> q: array<vec2<f32>, 64>;
 var<workgroup> s: array<f32, 256>;
-var<workgroup> red: array<f32, 256>;
+var<workgroup> red: array<f32, 512>;
 var<workgroup> rv: array<vec2<f32>, 256>;
 
-// Sum (or max) over the 256-thread workgroup. subgroup.wgsl has the fast version.
-fn reduce(v: f32, lid: u32, is_max: bool) -> f32 {
-  red[lid] = v;
+// Sum (or max) over the 256-thread workgroup in `red[off..]`. subgroup.wgsl has the fast version.
+fn reduce_at(v: f32, lid: u32, is_max: bool, off: u32) -> f32 {
+  red[off + lid] = v;
   workgroupBarrier();
   for (var h = 128u; h > 0u; h >>= 1u) {
     if (lid < h) {
       if (is_max) {
-        red[lid] = max(red[lid], red[lid + h]);
+        red[off + lid] = max(red[off + lid], red[off + lid + h]);
       } else {
-        red[lid] += red[lid + h];
+        red[off + lid] += red[off + lid + h];
       }
     }
     workgroupBarrier();
   }
-  let r = red[0];
-  workgroupBarrier();
-  return r;
+  return red[off];
 }
 
 // Workgroup (c, h): head h's query against its keys c·KEYS.. (up to n): the scores' maximum m,
-// the sum l of exp(score − m) and the sum of exp(score − m)·V, as part [h][c][head_dim + 2]:
-// the sums of V, then m and l. `combine` merges the parts of each head. The query is rounded to
-// f16, as the reference's flash attention stores it.
+// the sum l of exp(score − m) and the sum of exp(score − m)·V, as part [h][c][pairs + 1]:
+// the sums of V as pairs, then (m, l). `combine` merges the parts of each head. The query is
+// rounded to f16, as the reference's flash attention stores it.
 @compute @workgroup_size(256)
 fn attend(
   @builtin(workgroup_id) wg: vec3<u32>,
@@ -69,8 +68,9 @@ fn attend(
   let k0 = h * pairs * p.cols;
   let v_stride = num_workgroups.y * pairs;
   let v0 = v_stride * p.cols + h * pairs;
-  for (var i = lid; i < hd; i += 256u) {
-    q[i] = to_half(at_q[h * hd + i]);
+  if (lid < pairs) {
+    let v = at_q[h * pairs + lid];
+    q[lid] = vec2(to_half(v.x), to_half(v.y));
   }
   workgroupBarrier();
   let j0 = wg.x * KEYS;
@@ -80,17 +80,17 @@ fn attend(
     var acc = 0.0;
     for (var i = 0u; i < pairs; i++) {
       let k = unpack2x16float(at_kv[k0 + i * p.cols + j0 + lid]);
-      acc += q[2u * i] * k.x + q[2u * i + 1u] * k.y;
+      acc += dot(q[i], k);
     }
     x = acc * p.scale;
   }
-  let m = reduce(x, lid, true);
+  let m = reduce_at(x, lid, true, 0u);
   var e = 0.0;
   if (lid < n) {
     e = exp(x - m);
   }
   s[lid] = e;
-  let l = reduce(e, lid, false);
+  let l = reduce_at(e, lid, false, 256u);
   // Thread (g, c) sums V pair c over keys g, g + groups, ...
   let groups = 256u / pairs;
   let c = lid % pairs;
@@ -103,47 +103,51 @@ fn attend(
   }
   rv[lid] = o;
   workgroupBarrier();
-  let part = (h * ((p.n + KEYS - 1u) / KEYS) + wg.x) * (hd + 2u);
+  let part = (h * ((p.n + KEYS - 1u) / KEYS) + wg.x) * (pairs + 1u);
   if (lid < pairs) {
     var t = vec2(0.0);
     for (var k = 0u; k < groups; k++) {
       t += rv[k * pairs + lid];
     }
-    at_part[part + 2u * lid] = t.x;
-    at_part[part + 2u * lid + 1u] = t.y;
+    at_part[part + lid] = t;
   }
   if (lid == 0u) {
-    at_part[part + hd] = m;
-    at_part[part + hd + 1u] = l;
+    at_part[part + pairs] = vec2(m, l);
   }
 }
 
-@group(0) @binding(0) var<storage, read> cb_part: array<f32>;
-@group(0) @binding(1) var<storage, read_write> cb_o: array<f32>;
+@group(0) @binding(0) var<storage, read> cb_part: array<vec2<f32>>;
+@group(0) @binding(1) var<storage, read_write> cb_o: array<vec2<f32>>;
 
 // One workgroup per head: attend's parts rescaled to their common maximum, summed and normalized.
 @compute @workgroup_size(64)
 fn combine(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_index) lid: u32) {
-  let hd = p.dim;
+  let pairs = p.dim / 2u;
+  if (lid >= pairs) {
+    return;
+  }
   let parts = (p.n + KEYS - 1u) / KEYS;
-  let base = wg.x * parts * (hd + 2u);
+  let step = pairs + 1u;
+  let base = wg.x * parts * step;
+  if (parts == 1u) {
+    cb_o[wg.x * pairs + lid] = cb_part[base + lid] / cb_part[base + pairs].y;
+    return;
+  }
   var m = -3.0e38;
   for (var c = 0u; c < parts; c++) {
-    m = max(m, cb_part[base + c * (hd + 2u) + hd]);
+    m = max(m, cb_part[base + c * step + pairs].x);
   }
   var l = 0.0;
   for (var c = 0u; c < parts; c++) {
-    let at = base + c * (hd + 2u) + hd;
-    l += exp(cb_part[at] - m) * cb_part[at + 1u];
+    let ml = cb_part[base + c * step + pairs];
+    l += exp(ml.x - m) * ml.y;
   }
-  for (var i = lid; i < hd; i += 64u) {
-    var o = 0.0;
-    for (var c = 0u; c < parts; c++) {
-      let at = base + c * (hd + 2u);
-      o += exp(cb_part[at + hd] - m) * cb_part[at + i];
-    }
-    cb_o[wg.x * hd + i] = o / l;
+  var o = vec2(0.0);
+  for (var c = 0u; c < parts; c++) {
+    let at = base + c * step;
+    o += exp(cb_part[at + pairs].x - m) * cb_part[at + lid];
   }
+  cb_o[wg.x * pairs + lid] = o / l;
 }
 
 @group(0) @binding(0) var<storage, read> pk_x: array<f32>;

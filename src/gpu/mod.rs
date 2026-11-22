@@ -2071,9 +2071,10 @@ mod tests {
   #[test]
   fn attend_and_pack() {
     let half = |x: f32| f16::from_f32(x).to_f32();
-    // Moonshine's heads of 36; the kernel splits the keys into parts of 256.
+    // Moonshine's heads of 36; the kernel splits the keys into parts of 256. Also cover hd = 128
+    // (64 pairs, the full workgroup of `combine`).
     let keys = 4100;
-    for (heads, hd) in [(2, 40), (3, 36)] {
+    for (heads, hd) in [(2, 40), (3, 36), (1, 128)] {
       let d = heads * hd;
       // Rows of K then V of all heads, f16.
       let kv = random(keys * 2 * d, 7);
