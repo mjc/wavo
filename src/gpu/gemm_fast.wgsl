@@ -44,6 +44,8 @@ var<immediate> p: Params;
 @group(0) @binding(1) var<storage, read> bias: array<f32>;
 @group(0) @binding(2) var<storage, read_write> c: array<f32>;
 @group(0) @binding(3) var<storage, read> w: array<u32>;
+// gemm_f16 reads this binding as f16 vectors. Naga rejects `bitcast<vec2<f16>>`.
+@group(0) @binding(3) var<storage, read> wf16: array<vec4<f16>>;
 // Q8_0, Q5_0 and Q4_0: one f16 scale per block, two per word. Q4_1 and Q5_1: scale and minimum.
 // Q4_K: eight f32 pairs per 256 weights, formed at upload. Q6_K: 20 bytes per 256. Q5_K uses a
 // 20-byte record: f16 scale, f16 minimum, eight scales, eight minimums.
@@ -255,7 +257,7 @@ fn stage_a(m0: u32, k0: u32, i: u32, m_off: u32) {
   tile[o + 3u] = f16(v.w);
 }
 
-// Stages W[n0 + i / (KS / 4)][k0 + i % (KS / 4) · 4 ..+4], dequantized.
+// Stages F32 / Q8_0 W[n0 + i / (KS / 4)][k0 + i % (KS / 4) · 4 ..+4], dequantized.
 fn stage_w(n0: u32, k0: u32, i: u32) {
   let r = i / (KS / 4u);
   let kk = i % (KS / 4u) * 4u;
@@ -280,6 +282,22 @@ fn stage_w(n0: u32, k0: u32, i: u32) {
   tile[t + F] = f16(v.y);
   tile[t + 2u * F] = f16(v.z);
   tile[t + 3u * F] = f16(v.w);
+}
+
+// Stages F16 W[n0 + i / (KS / 4)][k0 + i % (KS / 4) · 4 ..+4] directly as f16.
+fn stage_w_f16(n0: u32, k0: u32, i: u32) {
+  let r = i / (KS / 4u);
+  let kk = i % (KS / 4u) * 4u;
+  let x = (n0 + r) * p.k + k0 + kk;
+  var v = vec4<f16>(0.0);
+  if (!WIDE || n0 + r < p.n) {
+    v = wf16[x / 4u];
+  }
+  let t = AT + (kk / F * 8u + r / F) * F * F + kk % F * F + r % F;
+  tile[t] = v.x;
+  tile[t + F] = v.y;
+  tile[t + 2u * F] = v.z;
+  tile[t + 3u * F] = v.w;
 }
 
 // Writes `ct`, rows q·F.. of each quadrant row, through the epilogue.
@@ -356,6 +374,111 @@ fn gemm(
     }
     for (var j = 1u; j < F * KS / 64u; j++) {
       stage_w(n0, k0, lane + j * 128u);
+    }
+    workgroupBarrier();
+    for (var f = 0u; f < KS / F; f++) {
+      let ta = (f * ROWS + sr) * F;
+      let tb = AT + (f * 8u + sc / F) * ff;
+      let a0 = coopLoadT<AM>(&tile[ta], F);
+      let a1 = coopLoadT<AM>(&tile[ta + ff], F);
+      let b0 = coopLoadT<BM>(&tile[tb], F);
+      let b1 = coopLoadT<BM>(&tile[tb + ff], F);
+      let b2 = coopLoadT<BM>(&tile[tb + 2u * ff], F);
+      let b3 = coopLoadT<BM>(&tile[tb + 3u * ff], F);
+      c00 = coopMultiplyAdd(a0, b0, c00);
+      c01 = coopMultiplyAdd(a0, b1, c01);
+      c02 = coopMultiplyAdd(a0, b2, c02);
+      c03 = coopMultiplyAdd(a0, b3, c03);
+      c10 = coopMultiplyAdd(a1, b0, c10);
+      c11 = coopMultiplyAdd(a1, b1, c11);
+      c12 = coopMultiplyAdd(a1, b2, c12);
+      c13 = coopMultiplyAdd(a1, b3, c13);
+      if (ROWS > 4u * F) {
+        let a2 = coopLoadT<AM>(&tile[ta + 2u * ff], F);
+        let a3 = coopLoadT<AM>(&tile[ta + 3u * ff], F);
+        c20 = coopMultiplyAdd(a2, b0, c20);
+        c21 = coopMultiplyAdd(a2, b1, c21);
+        c22 = coopMultiplyAdd(a2, b2, c22);
+        c23 = coopMultiplyAdd(a2, b3, c23);
+        c30 = coopMultiplyAdd(a3, b0, c30);
+        c31 = coopMultiplyAdd(a3, b1, c31);
+        c32 = coopMultiplyAdd(a3, b2, c32);
+        c33 = coopMultiplyAdd(a3, b3, c33);
+      }
+    }
+    workgroupBarrier();
+  }
+  let o = sg / 2u * 8u * ff + sc;
+  coopStoreT(c00, &ct[o], 8u * F);
+  coopStoreT(c01, &ct[o + F], 8u * F);
+  coopStoreT(c02, &ct[o + 2u * F], 8u * F);
+  coopStoreT(c03, &ct[o + 3u * F], 8u * F);
+  flush(m0, n0, 0u, lane);
+  coopStoreT(c10, &ct[o], 8u * F);
+  coopStoreT(c11, &ct[o + F], 8u * F);
+  coopStoreT(c12, &ct[o + 2u * F], 8u * F);
+  coopStoreT(c13, &ct[o + 3u * F], 8u * F);
+  flush(m0, n0, 1u, lane);
+  if (ROWS == 4u * F) {
+    return;
+  }
+  coopStoreT(c20, &ct[o], 8u * F);
+  coopStoreT(c21, &ct[o + F], 8u * F);
+  coopStoreT(c22, &ct[o + 2u * F], 8u * F);
+  coopStoreT(c23, &ct[o + 3u * F], 8u * F);
+  flush(m0, n0, 2u, lane);
+  coopStoreT(c30, &ct[o], 8u * F);
+  coopStoreT(c31, &ct[o + F], 8u * F);
+  coopStoreT(c32, &ct[o + 2u * F], 8u * F);
+  coopStoreT(c33, &ct[o + 3u * F], 8u * F);
+  flush(m0, n0, 3u, lane);
+}
+
+@compute @workgroup_size(128)
+fn gemm_f16(
+  @builtin(workgroup_id) wg: vec3<u32>,
+  @builtin(local_invocation_index) lane: u32,
+  @builtin(subgroup_id) sg: u32,
+  @builtin(subgroup_size) width: u32,
+  @builtin(num_subgroups) count: u32,
+) {
+  if (p.m == 0u) {
+    if (lane == 0u) {
+      c[0] = f32(width);
+      c[1] = f32(count + (scales[0] & 0u));
+    }
+    return;
+  }
+  let n0 = wg.x * 8u * F;
+  let m0 = wg.y * ROWS;
+  let m_off = select(0u, p.m, p.split > 0u && n0 >= p.split);
+  let sr = sg / 2u * ROWS / 2u;
+  let sc = sg % 2u * 4u * F;
+  let ff = F * F;
+  var c00: CM;
+  var c01: CM;
+  var c02: CM;
+  var c03: CM;
+  var c10: CM;
+  var c11: CM;
+  var c12: CM;
+  var c13: CM;
+  var c20: CM;
+  var c21: CM;
+  var c22: CM;
+  var c23: CM;
+  var c30: CM;
+  var c31: CM;
+  var c32: CM;
+  var c33: CM;
+  for (var k0 = 0u; k0 < p.k; k0 += KS) {
+    stage_a(m0, k0, lane, m_off);
+    stage_w_f16(n0, k0, lane);
+    for (var j = 1u; j < AT / 512u; j++) {
+      stage_a(m0, k0, lane + j * 128u, m_off);
+    }
+    for (var j = 1u; j < F * KS / 64u; j++) {
+      stage_w_f16(n0, k0, lane + j * 128u);
     }
     workgroupBarrier();
     for (var f = 0u; f < KS / F; f++) {

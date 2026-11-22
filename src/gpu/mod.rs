@@ -522,8 +522,10 @@ fn compile_fast(device: &wgpu::Device, f: usize) -> Option<FastPipelines> {
   let gemm = module(device, &source);
   let gemm: Vec<_> = (0..WEIGHT_TYPES * 2)
     .map(|i| {
-      let constants = [("WTYPE", (i / 2) as f64), ("ROWS", ((4 * f) << (i % 2)) as f64)];
-      pipeline(device, &gemm, "gemm", &constants)
+      let ty = i / 2;
+      let entry = if ty == 1 { "gemm_f16" } else { "gemm" };
+      let constants = [("WTYPE", ty as f64), ("ROWS", ((4 * f) << (i % 2)) as f64)];
+      pipeline(device, &gemm, entry, &constants)
     })
     .collect();
   let kernels = (f == 8).then(|| {
