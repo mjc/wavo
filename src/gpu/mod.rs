@@ -2180,8 +2180,11 @@ impl<'a> Pass<'a> {
     [cols, col]: [usize; 2],
   ) {
     let params = [rows, d, 0, cols, col, src, stride].map(|v| v as u32);
-    let size =
-      if rows == 1 { [d.div_ceil(256), 1, 1] } else { [rows.div_ceil(64), d.div_ceil(4), 1] };
+    let size = if rows == 1 {
+      [d.div_ceil(256), 1, 1]
+    } else {
+      [rows.div_ceil(32), (d / 2).div_ceil(32), 2]
+    };
     self.run(&self.gpu.decoder().pack, &[x, y], &params, size);
   }
 
@@ -3083,9 +3086,10 @@ mod tests {
   #[test]
   fn attend_and_pack() {
     let half = |x: f32| f16::from_f32(x).to_f32();
-    // Moonshine's heads of 36; the kernel splits the keys into parts of 256.
+    // Moonshine's heads of 36; the kernel splits the keys into parts of 256. Also cover hd = 128
+    // (64 pairs, the full workgroup of `combine`).
     let keys = 4100;
-    for (heads, hd) in [(2, 40), (3, 36)] {
+    for (heads, hd) in [(2, 40), (3, 36), (1, 128)] {
       let d = heads * hd;
       // Rows of K then V of all heads, f16.
       let kv = random(keys * 2 * d, 7);
@@ -3139,6 +3143,43 @@ mod tests {
         }
         let got: Vec<u32> = got.iter().map(|v| v.to_bits()).collect();
         assert_eq!(got, want, "pack {rows} rows");
+      }
+    }
+  }
+
+  #[test]
+  fn pack() {
+    let h = |x: f32| f16::from_f32(x).to_bits() as u32;
+    let cases = [
+      // Self-attention: single row into a non-multiple-of-32 cache and half (d = 288 -> half 144).
+      (1usize, 288usize, 194usize, 17usize, 288usize, 0usize),
+      (1, 384, 448, 0, 384, 0),
+      // Cross-attention: non-multiple-of-32 rows (37), half (51), cols (53), and odd src/stride.
+      (37, 102, 53, 11, 5, 211),
+      // Cross-attention: multi-tile rows and Moonshine-style non-multiple-of-32 half (144).
+      (70, 288, 70, 0, 0, 576),
+    ];
+    for (rows, d, cols, col, src, stride) in cases {
+      let half = d / 2;
+      let x_len = src + (rows - 1) * stride + 2 * d;
+      let x = random(x_len, (rows * 31 + d) as u32);
+      let y = random(cols * d, (cols * 17 + col) as u32);
+      let mut want: Vec<u32> = y.iter().map(|v| v.to_bits()).collect();
+      for j in 0..rows {
+        let pair = |i: usize| {
+          let off = src + j * stride + 2 * i;
+          h(x[off]) | h(x[off + 1]) << 16
+        };
+        for i in 0..half {
+          want[i * cols + col + j] = pair(i);
+          want[half * cols + (col + j) * half + i] = pair(half + i);
+        }
+      }
+      for gpu in gpus() {
+        let xb = up(gpu, &x);
+        let got = run(gpu, &y, |p, out| p.pack(&xb, [src, stride], out, rows, d, [cols, col]));
+        let got: Vec<u32> = got.iter().map(|v| v.to_bits()).collect();
+        assert_eq!(got, want, "pack rows={rows} d={d} cols={cols} col={col}");
       }
     }
   }
