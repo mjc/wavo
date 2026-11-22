@@ -206,109 +206,118 @@ fn spawn_worker(id: usize, done: Arc<Done>) -> Option<Arc<Worker>> {
   Some(worker)
 }
 
+impl Pool {
+  fn new() -> Self {
+    Self {
+      workers: Mutex::new(Vec::new()),
+      done: Arc::new(Done {
+        count: AtomicUsize::new(0),
+        waiting: AtomicBool::new(false),
+        lock: Mutex::new(()),
+        ready: Condvar::new(),
+      }),
+    }
+  }
+
+  fn run_threads<F: Fn(usize) + Sync>(&self, n: usize, work: &F) {
+    if n <= 1 {
+      work(0);
+      return;
+    }
+    let extra = n - 1;
+    if extra <= threads().saturating_sub(1)
+      && let Some(mut workers) = match self.workers.try_lock() {
+        Ok(guard) => Some(guard),
+        Err(TryLockError::Poisoned(e)) => Some(e.into_inner()),
+        Err(TryLockError::WouldBlock) => None,
+      }
+    {
+      while workers.len() < extra {
+        let Some(worker) = spawn_worker(workers.len(), Arc::clone(&self.done)) else { break };
+        workers.push(worker);
+      }
+      if extra <= workers.len() {
+        struct Runner<'a, F: Fn(usize) + Sync> {
+          work: &'a F,
+          next_id: AtomicUsize,
+          panic: Mutex<Option<Box<dyn std::any::Any + Send>>>,
+        }
+        fn invoke<F: Fn(usize) + Sync>(ptr: *const ()) {
+          // SAFETY: `ptr` points to `Runner<F>` alive until `WaitGuard::drop` completes.
+          let r = unsafe { &*ptr.cast::<Runner<'_, F>>() };
+          let tid = r.next_id.fetch_add(1, Ordering::Relaxed);
+          if let Err(e) = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| (r.work)(tid))) {
+            let mut slot = r.panic.lock().unwrap_or_else(PoisonError::into_inner);
+            if slot.is_none() {
+              *slot = Some(e);
+            }
+          }
+        }
+        struct WaitGuard<'a> {
+          done: &'a Done,
+          expected: usize,
+        }
+        impl Drop for WaitGuard<'_> {
+          fn drop(&mut self) {
+            for _ in 0..256 {
+              if self.done.count.load(Ordering::Acquire) >= self.expected {
+                return;
+              }
+              std::hint::spin_loop();
+            }
+            let mut guard = self.done.lock.lock().unwrap_or_else(PoisonError::into_inner);
+            self.done.waiting.store(true, Ordering::SeqCst);
+            while self.done.count.load(Ordering::SeqCst) < self.expected {
+              guard = self.done.ready.wait(guard).unwrap_or_else(PoisonError::into_inner);
+            }
+          }
+        }
+
+        let runner = Runner { work, next_id: AtomicUsize::new(1), panic: Mutex::new(None) };
+        let data = (&runner as *const Runner<'_, _>).cast();
+        self.done.count.store(0, Ordering::Relaxed);
+        self.done.waiting.store(false, Ordering::Relaxed);
+        for worker in &workers[..extra] {
+          {
+            let mut guard = worker.job.lock().unwrap_or_else(PoisonError::into_inner);
+            guard.func = invoke::<F>;
+            guard.data = data;
+            guard.generation = guard.generation.wrapping_add(1);
+            guard.expected = extra;
+          }
+          worker.wake.notify_one();
+        }
+        let wait = WaitGuard { done: &self.done, expected: extra };
+        work(0);
+        drop(wait);
+        drop(workers);
+        if let Some(e) = runner.panic.into_inner().unwrap_or_else(PoisonError::into_inner) {
+          std::panic::resume_unwind(e);
+        }
+        return;
+      }
+      drop(workers);
+    }
+
+    std::thread::scope(|s| {
+      for tid in 1..n {
+        s.spawn(move || work(tid));
+      }
+      work(0);
+    });
+  }
+}
+
 fn pool() -> &'static Pool {
   static POOL: OnceLock<Pool> = OnceLock::new();
-  POOL.get_or_init(|| Pool {
-    workers: Mutex::new(Vec::new()),
-    done: Arc::new(Done {
-      count: AtomicUsize::new(0),
-      waiting: AtomicBool::new(false),
-      lock: Mutex::new(()),
-      ready: Condvar::new(),
-    }),
-  })
+  POOL.get_or_init(Pool::new)
 }
 
 /// Runs `work(tid)` on `n` threads (`0..n`, with `0` on the calling thread), using the persistent
 /// worker pool when uncontended (growing lazily up to `threads() - 1` workers) and falling back to
 /// `std::thread::scope` if nested, busy, or a worker fails to spawn.
 pub fn run_threads<F: Fn(usize) + Sync>(n: usize, work: &F) {
-  if n <= 1 {
-    work(0);
-    return;
-  }
-  let p = pool();
-  let extra = n - 1;
-  if extra <= threads().saturating_sub(1)
-    && let Some(mut workers) = match p.workers.try_lock() {
-      Ok(guard) => Some(guard),
-      Err(TryLockError::Poisoned(e)) => Some(e.into_inner()),
-      Err(TryLockError::WouldBlock) => None,
-    }
-  {
-    while workers.len() < extra {
-      let Some(worker) = spawn_worker(workers.len(), Arc::clone(&p.done)) else { break };
-      workers.push(worker);
-    }
-    if extra <= workers.len() {
-      struct Runner<'a, F: Fn(usize) + Sync> {
-        work: &'a F,
-        next_id: AtomicUsize,
-        panic: Mutex<Option<Box<dyn std::any::Any + Send>>>,
-      }
-      fn invoke<F: Fn(usize) + Sync>(ptr: *const ()) {
-        // SAFETY: `ptr` points to `Runner<F>` alive until `WaitGuard::drop` completes.
-        let r = unsafe { &*ptr.cast::<Runner<'_, F>>() };
-        let tid = r.next_id.fetch_add(1, Ordering::Relaxed);
-        if let Err(e) = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| (r.work)(tid))) {
-          let mut slot = r.panic.lock().unwrap_or_else(PoisonError::into_inner);
-          if slot.is_none() {
-            *slot = Some(e);
-          }
-        }
-      }
-      struct WaitGuard<'a> {
-        done: &'a Done,
-        expected: usize,
-      }
-      impl Drop for WaitGuard<'_> {
-        fn drop(&mut self) {
-          for _ in 0..256 {
-            if self.done.count.load(Ordering::Acquire) >= self.expected {
-              return;
-            }
-            std::hint::spin_loop();
-          }
-          let mut guard = self.done.lock.lock().unwrap_or_else(PoisonError::into_inner);
-          self.done.waiting.store(true, Ordering::SeqCst);
-          while self.done.count.load(Ordering::SeqCst) < self.expected {
-            guard = self.done.ready.wait(guard).unwrap_or_else(PoisonError::into_inner);
-          }
-        }
-      }
-
-      let runner = Runner { work, next_id: AtomicUsize::new(1), panic: Mutex::new(None) };
-      let data = (&runner as *const Runner<'_, _>).cast();
-      p.done.count.store(0, Ordering::Relaxed);
-      p.done.waiting.store(false, Ordering::Relaxed);
-      for worker in &workers[..extra] {
-        {
-          let mut guard = worker.job.lock().unwrap_or_else(PoisonError::into_inner);
-          guard.func = invoke::<F>;
-          guard.data = data;
-          guard.generation = guard.generation.wrapping_add(1);
-          guard.expected = extra;
-        }
-        worker.wake.notify_one();
-      }
-      let wait = WaitGuard { done: &p.done, expected: extra };
-      work(0);
-      drop(wait);
-      drop(workers);
-      if let Some(e) = runner.panic.into_inner().unwrap_or_else(PoisonError::into_inner) {
-        std::panic::resume_unwind(e);
-      }
-      return;
-    }
-    drop(workers);
-  }
-
-  std::thread::scope(|s| {
-    for tid in 1..n {
-      s.spawn(move || work(tid));
-    }
-    work(0);
-  });
+  pool().run_threads(n, work);
 }
 
 /// `f(scratch, item)` for each item, on at most `max_threads` worker threads (no more than there
@@ -793,80 +802,56 @@ mod tests {
 
   #[test]
   fn pool_blocks_and_recovers_after_panics() {
-    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    use std::sync::atomic::{AtomicBool, Ordering};
     if super::threads() < 2 {
       return;
     }
+    let pool = super::Pool::new();
     let is_worker = || std::thread::current().name().is_some_and(|n| n.starts_with("wavo-cpu-"));
 
-    // Exercise the blocking condvar wait path after the 256-iteration spin budget.
-    let seen = AtomicUsize::new(0);
-    super::run_threads(2, &|tid| {
+    // Hold the worker until the caller enters the blocking Condvar wait (`done.waiting == true`).
+    let blocked = AtomicBool::new(false);
+    pool.run_threads(2, &|tid| {
       if tid == 1 {
-        std::thread::sleep(std::time::Duration::from_millis(5));
+        assert!(is_worker());
+        while !pool.done.waiting.load(Ordering::Acquire) {
+          std::thread::yield_now();
+        }
+        blocked.store(true, Ordering::Relaxed);
       }
-      seen.fetch_add(1, Ordering::Relaxed);
     });
-    assert_eq!(seen.load(Ordering::Relaxed), 2);
+    assert!(blocked.load(Ordering::Relaxed));
+    assert_eq!(pool.workers.lock().unwrap().len(), 1, "pool should grow lazily");
 
     // Caller panic on the pool poisons its lock, and later calls still recover it.
-    let mut ran_on_pool = false;
-    for _ in 0..64 {
-      let on_pool = AtomicBool::new(false);
-      let res = std::panic::catch_unwind(|| {
-        super::run_threads(2, &|tid| {
-          if tid == 1 {
-            on_pool.store(is_worker(), Ordering::Relaxed);
-          } else {
-            panic!("caller boom");
-          }
-        });
+    let res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+      pool.run_threads(2, &|tid| {
+        if tid == 0 {
+          panic!("caller boom");
+        }
+        assert!(is_worker());
       });
-      assert!(res.is_err());
-      if on_pool.load(Ordering::Relaxed) {
-        ran_on_pool = true;
-        break;
-      }
-      std::thread::yield_now();
-    }
-    assert!(ran_on_pool, "caller panic never exercised the persistent pool");
+    }));
+    assert!(res.is_err());
 
     // Worker panic propagates to the caller and leaves the pool reusable.
-    let mut worker_panicked_on_pool = false;
-    for _ in 0..64 {
-      let on_pool = AtomicBool::new(false);
-      let res = std::panic::catch_unwind(|| {
-        super::run_threads(2, &|tid| {
-          if tid == 1 {
-            on_pool.store(is_worker(), Ordering::Relaxed);
-            panic!("worker boom");
-          }
-        });
-      });
-      assert!(res.is_err());
-      if on_pool.load(Ordering::Relaxed) {
-        worker_panicked_on_pool = true;
-        break;
-      }
-      std::thread::yield_now();
-    }
-    assert!(worker_panicked_on_pool, "worker panic never exercised the persistent pool");
-
-    // Subsequent work still runs on the persistent worker thread (not scoped fallback).
-    let mut reused = false;
-    for _ in 0..64 {
-      let on_pool = AtomicBool::new(false);
-      super::run_threads(2, &|tid| {
+    let res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+      pool.run_threads(2, &|tid| {
         if tid == 1 {
-          on_pool.store(is_worker(), Ordering::Relaxed);
+          assert!(is_worker());
+          panic!("worker boom");
         }
       });
-      if on_pool.load(Ordering::Relaxed) {
-        reused = true;
-        break;
+    }));
+    assert!(res.is_err());
+
+    // Subsequent work still runs on the persistent worker thread (not scoped fallback).
+    let reused = AtomicBool::new(false);
+    pool.run_threads(2, &|tid| {
+      if tid == 1 {
+        reused.store(is_worker(), Ordering::Relaxed);
       }
-      std::thread::yield_now();
-    }
-    assert!(reused, "expected pool worker reuse after panics");
+    });
+    assert!(reused.load(Ordering::Relaxed), "expected pool worker reuse after panics");
   }
 }
