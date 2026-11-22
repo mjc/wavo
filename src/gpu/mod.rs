@@ -356,7 +356,8 @@ fn compile_fast(device: &wgpu::Device, f: usize) -> Option<FastPipelines> {
 /// subgroup.wgsl's.
 struct Decoder {
   layer_norm: Option<Pipeline>,
-  gemv: Vec<Pipeline>,
+  /// One per weight type: 64-thread workgroups (`l.cols <= 512`), then 256-thread ones.
+  gemv: [Vec<Pipeline>; 2],
   embed: Vec<Pipeline>,
   attend: Pipeline,
   combine: Pipeline,
@@ -849,9 +850,13 @@ impl Gpu {
       };
       let decode = module(device, &source(include_str!("decode.wgsl")));
       let ops = fast.then(|| module(device, &source(include_str!("ops.wgsl"))));
+      let gemvs = |groups| {
+        let constants = |ty| [("WTYPE", ty as f64), ("GROUPS", groups as f64)];
+        (0..3).map(|ty| pipeline(device, gemm, "gemv", &constants(ty))).collect()
+      };
       Decoder {
         layer_norm: ops.map(|ops| pipeline(device, &ops, "layer_norm", &[])),
-        gemv: gemms(device, gemm, "gemv"),
+        gemv: [gemvs(2), gemvs(8)],
         embed: gemms(device, gemm, "embed"),
         attend: pipeline(device, &decode, "attend", &[]),
         combine: pipeline(device, &decode, "combine", &[]),
@@ -1463,7 +1468,14 @@ impl<'a> Pass<'a> {
     let [mode, alpha] = epilogue.params();
     let params = [1, l.cols as u32, l.k as u32, mode, alpha, 0, offset as u32];
     let buffers = [a, &l.bias, c, &l.weight, l.scales.as_ref().unwrap_or(&l.bias)];
-    self.run(&self.gpu.decoder().gemv[l.ty], &buffers, &params, [l.cols / 32, 1, 1]);
+    // Narrow layers (small d) launch too few 256-thread workgroups to fill the GPU.
+    let (tier, groups) = if l.cols <= 512 { (0, 2) } else { (1, 8) };
+    self.run(
+      &self.gpu.decoder().gemv[tier][l.ty],
+      &buffers,
+      &params,
+      [l.cols / (4 * groups), 1, 1],
+    );
   }
 
   /// `c` = row `ids[i]` of the table `l` + `pos[offset..]` + the table's bias, `l.k` values. `ids`
@@ -2026,8 +2038,9 @@ mod tests {
 
   #[test]
   fn gemv_and_embed() {
-    // 100 rows padded to 128 by `linear`; 288, a multiple of 32, written as they are.
-    for (n, cols) in [(100, 128), (288, 288)] {
+    // 100 rows padded to 128 by `linear`; 288, a multiple of 32, written as they are; 576 takes
+    // the wider workgroup tier.
+    for (n, cols) in [(100, 128), (288, 288), (576, 576)] {
       let k = 96;
       let bias = random(n, 2);
       let a = random(k, 3);
