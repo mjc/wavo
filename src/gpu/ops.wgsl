@@ -1,13 +1,16 @@
 // Copyright (c) vladkens | MIT License | https://github.com/vladkens/wavo
 // Row-wise and convolution kernels over time-major [t][ch] F32 activations.
 
+// Whether conv_glu runs LayerNorm (true) or a per-channel affine x·g + b (false).
+override LAYER_NORM: bool = true;
+
 // One immediate struct for all kernels: naga sizes a module's immediates from its first one.
 struct Params {
   t: u32,
   ch: u32,
   head_dim: u32,
   scale: f32,
-  // conv_glu: the depthwise kernel size, and 1 for LayerNorm or 0 for the affine x·g + b.
+  // conv_glu: the depthwise kernel size; rotary: neox (1) or normal (0).
   kernel: u32,
   layer_norm: u32,
   // im2col: the conv's stride and padding (and `kernel`).
@@ -127,9 +130,40 @@ fn im2col(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_index)
   col_y[i * width + e] = v;
 }
 
-// Conformer conv module between the pointwise convs, one workgroup per frame: GLU (first half ·
-// sigmoid(second half)) of h [t][2·ch], depthwise conv (odd kernel, centred, weight [ch][kernel])
-// plus bias, LayerNorm over channels or a per-channel affine, SiLU.
+// GLU over h [t][2·ch] into y [t][ch]: y[t][c] = h[t][c] / (1 + exp(-h[t][ch + c])).
+
+@group(0) @binding(0) var<storage, read> glu_h: array<f32>;
+@group(0) @binding(1) var<storage, read_write> glu_y: array<f32>;
+
+@compute @workgroup_size(256)
+fn glu(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_index) lid: u32) {
+  let i = wg.x * 256u + lid;
+  let c4 = p.ch / 4u;
+  if (i < c4) {
+    let c = i * 4u;
+    let b0 = wg.y * 2u * p.ch + c;
+    let b1 = b0 + p.ch;
+    let x = vec4(glu_h[b0], glu_h[b0 + 1u], glu_h[b0 + 2u], glu_h[b0 + 3u]);
+    let g = vec4(glu_h[b1], glu_h[b1 + 1u], glu_h[b1 + 2u], glu_h[b1 + 3u]);
+    let y = x / (vec4(1.0) + exp(-g));
+    let o = wg.y * p.ch + c;
+    glu_y[o] = y.x;
+    glu_y[o + 1u] = y.y;
+    glu_y[o + 2u] = y.z;
+    glu_y[o + 3u] = y.w;
+  }
+  if (wg.x == 0u) {
+    let c = c4 * 4u + lid;
+    if (c < p.ch) {
+      let base = wg.y * 2u * p.ch + c;
+      glu_y[wg.y * p.ch + c] = glu_h[base] / (1.0 + exp(-glu_h[base + p.ch]));
+    }
+  }
+}
+
+// Conformer conv module between the pointwise convs, one workgroup per frame: depthwise conv
+// over GLU output h [t][ch] (odd kernel, centred, weight [kernel][ch]) plus bias, LayerNorm over
+// channels or a per-channel affine, SiLU.
 
 @group(0) @binding(0) var<storage, read> conv_h: array<f32>;
 @group(0) @binding(1) var<storage, read> conv_w: array<f32>;
@@ -149,26 +183,29 @@ fn conv_glu(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_inde
       // Source frame plus the padding.
       let src = t + k;
       if (src >= pad && src - pad < p.t) {
-        let base = (src - pad) * 2u * p.ch;
-        acc += conv_w[i * p.kernel + k] * conv_h[base + i] / (1.0 + exp(-conv_h[base + p.ch + i]));
+        acc += conv_w[k * p.ch + i] * conv_h[(src - pad) * p.ch + i];
       }
     }
-    row[i] = acc;
-    s += acc;
-  }
-  let mean = reduce_sum(s, lid) / f32(p.ch);
-  var q = 0.0;
-  for (var i = lid; i < p.ch; i += 256u) {
-    let d = row[i] - mean;
-    q += d * d;
-  }
-  let rstd = inverseSqrt(reduce_sum(q, lid) / f32(p.ch) + 1e-5);
-  for (var i = lid; i < p.ch; i += 256u) {
-    var y = row[i] * conv_g[i] + conv_beta[i];
-    if (p.layer_norm != 0u) {
-      y = (row[i] - mean) * rstd * conv_g[i] + conv_beta[i];
+    if (LAYER_NORM) {
+      row[i] = acc;
+      s += acc;
+    } else {
+      let y = acc * conv_g[i] + conv_beta[i];
+      conv_y[t * p.ch + i] = y / (1.0 + exp(-y));
     }
-    conv_y[t * p.ch + i] = y / (1.0 + exp(-y));
+  }
+  if (LAYER_NORM) {
+    let mean = reduce_sum(s, lid) / f32(p.ch);
+    var q = 0.0;
+    for (var i = lid; i < p.ch; i += 256u) {
+      let d = row[i] - mean;
+      q += d * d;
+    }
+    let rstd = inverseSqrt(reduce_sum(q, lid) / f32(p.ch) + 1e-5);
+    for (var i = lid; i < p.ch; i += 256u) {
+      let y = (row[i] - mean) * rstd * conv_g[i] + conv_beta[i];
+      conv_y[t * p.ch + i] = y / (1.0 + exp(-y));
+    }
   }
 }
 
