@@ -140,6 +140,29 @@ pub fn p_cores() -> usize {
   })
 }
 
+static BENCH_P_CORES: AtomicBool = AtomicBool::new(false);
+
+#[cfg(target_os = "macos")]
+fn set_p_core_qos() {
+  unsafe extern "C" {
+    fn pthread_set_qos_class_self_np(qos_class: u32, relative_priority: i32) -> i32;
+  }
+  // QOS_CLASS_USER_INTERACTIVE (0x21).
+  // SAFETY: libSystem FFI call with a valid constant QoS class.
+  unsafe {
+    let _ = pthread_set_qos_class_self_np(0x21, 0);
+  }
+}
+
+/// Ask macOS to schedule the calling thread and newly spawned CPU pool workers on performance
+/// cores; called only by `wavo bench` so benchmark timings aren't skewed by efficiency-core
+/// placement.
+pub fn bench_prefer_p_cores() {
+  BENCH_P_CORES.store(true, Ordering::Relaxed);
+  #[cfg(target_os = "macos")]
+  set_p_core_qos();
+}
+
 /// Threads for the encoders' kernels: the CPUs this process may run on (`taskset` and cgroup
 /// limits count).
 pub fn threads() -> usize {
@@ -184,6 +207,10 @@ fn spawn_worker(id: usize, done: Arc<Done>) -> Option<Arc<Worker>> {
   std::thread::Builder::new()
     .name(format!("wavo-cpu-{id}"))
     .spawn(move || {
+      #[cfg(target_os = "macos")]
+      if BENCH_P_CORES.load(Ordering::Relaxed) {
+        set_p_core_qos();
+      }
       let mut seen = 0usize;
       loop {
         let job = {
