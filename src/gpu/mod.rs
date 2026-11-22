@@ -220,6 +220,8 @@ pub struct Gpu {
   fast: Fast,
   /// Bound for a writable output a dispatch doesn't use, so no writable binding aliases another.
   spare: Buffer,
+  /// Partial sum and sum-of-squares scratch for `Pass::group_norm` (up to 64 workgroups).
+  group_part: Buffer,
   /// One slot per submission of a call, set to the call's number when its work is done. A driver
   /// may cancel a long submission and report success (i915 does after 20 s), which would read
   /// back the previous call's output; a slot without the number makes the call an error instead.
@@ -259,6 +261,7 @@ struct Portable {
   first_depthwise: Pipeline,
   flatten: Pipeline,
   rope: Pipeline,
+  group_norm_stats: Pipeline,
   group_norm: Pipeline,
   swiglu: Pipeline,
   relu: Pipeline,
@@ -311,6 +314,7 @@ impl Portable {
       first_depthwise: pipeline(device, &spatial, "first_depthwise", &[]),
       flatten: pipeline(device, &spatial, "flatten", &[]),
       rope: pipeline(device, &ops, "rotary", &[]),
+      group_norm_stats: pipeline(device, &ops, "group_norm_stats", &[]),
       group_norm: pipeline(device, &ops, "group_norm", &[]),
       swiglu: pipeline(device, &ops, "swiglu", &[]),
       relu: pipeline(device, &ops, "relu", &[]),
@@ -550,6 +554,7 @@ impl Gpu {
       })
     };
     let spare = buffer(4, wgpu::BufferUsages::STORAGE);
+    let group_part = buffer(128 * 4, wgpu::BufferUsages::STORAGE);
     let marks = buffer(MARKS * 4, wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC);
     let marks_read = buffer(MARKS * 4, wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST);
     let mut gpu = Self {
@@ -560,6 +565,7 @@ impl Gpu {
       kernels,
       fast: Fast::default(),
       spare,
+      group_part,
       marks,
       marks_read,
       calls: AtomicU32::new(0),
@@ -1668,8 +1674,11 @@ impl<'a> Pass<'a> {
   /// GroupNorm with one group, in place over `x` `[t][ch]`: normalized over all its values, then
   /// times `n.w` and plus `n.b` per channel.
   pub fn group_norm(&mut self, x: &Buffer, n: &Channels, t: usize, ch: usize, eps: f32) {
+    let k = &self.gpu.kernels;
     let params = [t as u32, ch as u32, 0, eps.to_bits()];
-    self.run(&self.gpu.kernels.group_norm, &[x, &n.w, &n.b], &params, [1, 1, 1]);
+    let wgs = (t * ch / 4).div_ceil(256).clamp(1, 64);
+    self.run(&k.group_norm_stats, &[x, &self.gpu.group_part], &params, [wgs, 1, 1]);
+    self.run(&k.group_norm, &[x, &n.w, &n.b, &self.gpu.group_part], &params, [wgs, 1, 1]);
   }
 
   /// SwiGLU in place over one row `h` `[x | gate]` of 2·`ch`: `h[..ch]` = SiLU(gate) · x.
@@ -1690,7 +1699,7 @@ impl<'a> Pass<'a> {
   /// `x` `[t][f][ch]` to `y` `[t][ch · f]`, channel-major.
   pub fn flatten(&mut self, x: &Buffer, y: &Buffer, t: usize, f: usize, ch: usize) {
     let k = &self.gpu.kernels.flatten;
-    self.run(k, &[x, y], &[t as u32, f as u32, ch as u32], [t, 1, 1]);
+    self.run(k, &[x, y], &[t as u32, f as u32, ch as u32], [f.div_ceil(16), ch.div_ceil(16), t]);
   }
 }
 

@@ -11,8 +11,8 @@ struct Params {
 
 var<immediate> p: Params;
 
-// LayerNorm, four rows per workgroup. The rotary output recomputes the normalized partner element
-// instead of exchanging it.
+// LayerNorm, four rows per workgroup. The rotary output fuses norm_y and norm_yr into one
+// (i, i + half) pass so each element is normalized once.
 
 @group(0) @binding(0) var<storage, read> norm_x: array<f32>;
 @group(0) @binding(1) var<storage, read> norm_g: array<f32>;
@@ -44,13 +44,24 @@ fn layer_norm(
   // Rows past the end compute on the last row and skip the stores.
   let r = wg.x * 4u + sg;
   let t = min(r, p.t - 1u);
+  let ch4 = p.ch / 4u;
   var s = 0.0;
-  for (var i = sl; i < p.ch; i += 32u) {
+  for (var i = sl; i < ch4; i += 32u) {
+    let o = t * p.ch + i * 4u;
+    let v = vec4(norm_x[o], norm_x[o + 1u], norm_x[o + 2u], norm_x[o + 3u]);
+    s += v.x + v.y + v.z + v.w;
+  }
+  for (var i = ch4 * 4u + sl; i < p.ch; i += 32u) {
     s += norm_x[t * p.ch + i];
   }
   let mean = subgroupAdd(s) / f32(p.ch);
   var q = 0.0;
-  for (var i = sl; i < p.ch; i += 32u) {
+  for (var i = sl; i < ch4; i += 32u) {
+    let o = t * p.ch + i * 4u;
+    let d = vec4(norm_x[o], norm_x[o + 1u], norm_x[o + 2u], norm_x[o + 3u]) - mean;
+    q += dot(d, d);
+  }
+  for (var i = ch4 * 4u + sl; i < p.ch; i += 32u) {
     let d = norm_x[t * p.ch + i] - mean;
     q += d * d;
   }
@@ -58,23 +69,35 @@ fn layer_norm(
   if (r >= p.t) {
     return;
   }
-  for (var i = sl; i < p.ch; i += 32u) {
-    norm_y[t * p.ch + i] = normalized(t, i, st);
-  }
   if (p.head_dim == 0u) {
+    for (var i = sl; i < ch4; i += 32u) {
+      let c = i * 4u;
+      let o = t * p.ch + c;
+      let x = vec4(norm_x[o], norm_x[o + 1u], norm_x[o + 2u], norm_x[o + 3u]);
+      let g = vec4(norm_g[c], norm_g[c + 1u], norm_g[c + 2u], norm_g[c + 3u]);
+      let b = vec4(norm_b[c], norm_b[c + 1u], norm_b[c + 2u], norm_b[c + 3u]);
+      let y = (x - st.x) * st.y * g + b;
+      norm_y[o] = y.x;
+      norm_y[o + 1u] = y.y;
+      norm_y[o + 2u] = y.z;
+      norm_y[o + 3u] = y.w;
+    }
+    for (var i = ch4 * 4u + sl; i < p.ch; i += 32u) {
+      norm_y[t * p.ch + i] = normalized(t, i, st);
+    }
     return;
   }
   let half = p.head_dim / 2u;
-  for (var i = sl; i < p.ch; i += 32u) {
-    let d = i % p.head_dim;
-    let f = d % half;
+  for (var j = sl; j < p.ch / 2u; j += 32u) {
+    let f = j % half;
+    let i = j / half * p.head_dim + f;
+    let v0 = normalized(t, i, st);
+    let v1 = normalized(t, i + half, st);
+    norm_y[t * p.ch + i] = v0;
+    norm_y[t * p.ch + i + half] = v1;
+    let cs = rope[t * p.head_dim + f];
     let sn = rope[t * p.head_dim + half + f];
-    var vr = normalized(t, i, st) * rope[t * p.head_dim + f];
-    if (d < half) {
-      vr -= normalized(t, i + half, st) * sn;
-    } else {
-      vr += normalized(t, i - half, st) * sn;
-    }
-    norm_yr[t * p.ch + i] = vr;
+    norm_yr[t * p.ch + i] = v0 * cs - v1 * sn;
+    norm_yr[t * p.ch + i + half] = v0 * sn + v1 * cs;
   }
 }
