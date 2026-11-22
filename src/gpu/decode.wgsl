@@ -150,26 +150,66 @@ fn combine(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_index
 @group(0) @binding(1) var<storage, read_write> pk_y: array<u32>;
 
 // n rows of x, each K then V (2·d floats from src + j·stride), into the cache at positions col..:
-// pair i of row j is x[2i], x[2i + 1] (of V for i ≥ d/2). One row: a thread per pair; more: 64
-// rows × 4 pairs per workgroup, so the transposed K is written in runs of 64 positions.
+// pair i of row j is x[2i], x[2i + 1] (of V for i ≥ d/2). One row: a thread per pair; more:
+// 32 rows × 32 pairs per workgroup (wg.z = 0 for K, 1 for V), so loads from pk_x and stores to
+// both K (via a padded shared tile) and V are coalesced across consecutive lanes.
+var<workgroup> tile: array<u32, 1056>;
+
 @compute @workgroup_size(256)
 fn pack(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_index) lid: u32) {
-  var i = wg.x * 256u + lid;
-  var j = 0u;
-  if (p.n > 1u) {
-    i = wg.y * 4u + lid / 64u;
-    j = wg.x * 64u + lid % 64u;
-  }
   let half = p.dim / 2u;
-  if (i >= p.dim || j >= p.n) {
-    return;
+  if (p.n == 1u) {
+    let i = wg.x * 256u + lid;
+    if (i < p.dim) {
+      let x = p.src + 2u * i;
+      var at = i * p.cols + p.col;
+      if (i >= half) {
+        at = half * p.cols + p.col * half + i - half;
+      }
+      pk_y[at] = pack2x16float(vec2(to_half(pk_x[x]), to_half(pk_x[x + 1u])));
+    }
+  } else {
+    let j0 = wg.x * 32u;
+    let i0 = wg.y * 32u;
+    let lx = lid % 32u;
+    let ly = lid / 32u;
+    if (wg.z != 0u) {
+      let iv = i0 + lx;
+      if (iv < half) {
+        let base = p.src + p.dim + 2u * iv;
+        let out_base = half * p.cols + p.col * half + iv;
+        for (var k = 0u; k < 4u; k++) {
+          let j = j0 + ly + k * 8u;
+          if (j < p.n) {
+            let x = base + j * p.stride;
+            pk_y[out_base + j * half] =
+              pack2x16float(vec2(to_half(pk_x[x]), to_half(pk_x[x + 1u])));
+          }
+        }
+      }
+    } else {
+      let ik = i0 + lx;
+      for (var k = 0u; k < 4u; k++) {
+        let r = ly + k * 8u;
+        let j = j0 + r;
+        if (j < p.n && ik < half) {
+          let x = p.src + j * p.stride + 2u * ik;
+          tile[r * 33u + lx] = pack2x16float(vec2(to_half(pk_x[x]), to_half(pk_x[x + 1u])));
+        }
+      }
+      workgroupBarrier();
+      let jk = j0 + lx;
+      if (jk < p.n) {
+        for (var k = 0u; k < 4u; k++) {
+          let r = ly + k * 8u;
+          let i = i0 + r;
+          if (i < half) {
+            pk_y[i * p.cols + p.col + jk] = tile[lx * 33u + r];
+          }
+        }
+      }
+    }
   }
-  let x = p.src + j * p.stride + 2u * i;
-  var at = i * p.cols + p.col + j;
-  if (i >= half) {
-    at = half * p.cols + (p.col + j) * half + i - half;
-  }
-  pk_y[at] = pack2x16float(vec2(to_half(pk_x[x]), to_half(pk_x[x + 1u])));
 }
 
 // gemm.wgsl's rounding to the nearest f16: pack2x16float truncates on DX12 (RTX 4060).
