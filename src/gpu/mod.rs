@@ -265,16 +265,21 @@ struct Portable {
   gemm_module: wgpu::ShaderModule,
   /// Compiled on first use: only encoder–decoder models need them.
   decoder: OnceLock<Decoder>,
+  /// Whether `ops` and `decode` use `subgroup.wgsl` reductions.
+  subgroup: bool,
 }
 
 impl Portable {
-  fn new(device: &wgpu::Device, gemm_tile: [usize; 2]) -> Self {
+  fn new(device: &wgpu::Device, gemm_tile: [usize; 2], subgroup: bool) -> Self {
     let cpu = gemm_tile[0] == 64;
     let gemm = match cpu {
       true => module(device, &[include_str!("gemm.wgsl"), include_str!("gemm_cpu.wgsl")].concat()),
       false => module(device, include_str!("gemm.wgsl")),
     };
-    let ops = module(device, include_str!("ops.wgsl"));
+    let ops = match subgroup {
+      true => module(device, &swap_fns(include_str!("ops.wgsl"), include_str!("subgroup.wgsl"))),
+      false => module(device, include_str!("ops.wgsl")),
+    };
     let attention = module(device, include_str!("attention.wgsl"));
     let spatial = module(device, include_str!("spatial.wgsl"));
     Self {
@@ -307,6 +312,7 @@ impl Portable {
       mark: pipeline(device, &ops, "mark", &[]),
       gemm_module: gemm,
       decoder: OnceLock::new(),
+      subgroup,
     }
   }
 }
@@ -351,11 +357,9 @@ fn compile_fast(device: &wgpu::Device, f: usize) -> Option<FastPipelines> {
   (errors == 0).then_some((gemm, kernels))
 }
 
-/// Kernels for one decoder token: `gemv` and `embed` per weight type, `attend`, `combine`, `pack`
-/// and, with the fast tier, a LayerNorm of one row. With the fast tier their reductions are
-/// subgroup.wgsl's.
+/// Kernels for one decoder token: `gemv` and `embed` per weight type, `attend`, `combine` and
+/// `pack`. With the fast tier their reductions are subgroup.wgsl's.
 struct Decoder {
-  layer_norm: Option<Pipeline>,
   gemv: Vec<Pipeline>,
   embed: Vec<Pipeline>,
   attend: Pipeline,
@@ -468,6 +472,10 @@ impl Gpu {
 
     let info = Device::new(&adapter.get_info(), Kernels::Portable);
     let portable = matches!(forced, Some(Forced::Portable(_)));
+    let subgroup = fast
+      && !portable
+      && info.api != Api::Dx12
+      && adapter.features().contains(wgpu::Features::SUBGROUP);
     let size = if fast && !portable { fast_size(&adapter) } else { None };
     let fast = size.is_some();
     let tensor = size == Some(8) && tensor_gpu(&adapter) && forced != Some(Forced::Matrix8);
@@ -477,6 +485,8 @@ impl Gpu {
     let mut features = wgpu::Features::IMMEDIATES;
     if fast {
       features |= COOP;
+    } else if subgroup {
+      features |= wgpu::Features::SUBGROUP;
     }
     if mappable {
       features |= wgpu::Features::MAPPABLE_PRIMARY_BUFFERS;
@@ -523,7 +533,7 @@ impl Gpu {
         (_, Some(16), _) => [128, 32],
         _ => [128, 64],
       };
-      (Portable::new(&device, tile), compiled.join().unwrap())
+      (Portable::new(&device, tile, subgroup), compiled.join().unwrap())
     });
     let weights = wgpu::BufferUsages::STORAGE
       | if mappable { wgpu::BufferUsages::MAP_WRITE } else { wgpu::BufferUsages::COPY_DST };
@@ -841,16 +851,15 @@ impl Gpu {
     self.kernels.decoder.get_or_init(|| {
       let device = &self.device;
       let fast = self.fast.size != 0;
-      let source =
-        |s: &str| if fast { swap_fns(s, include_str!("subgroup.wgsl")) } else { s.into() };
+      let swap = |use_sg: bool, s: &str| {
+        if use_sg { swap_fns(s, include_str!("subgroup.wgsl")) } else { s.into() }
+      };
       let gemm = match fast {
-        true => &module(device, &source(include_str!("gemm.wgsl"))),
+        true => &module(device, &swap(true, include_str!("gemm.wgsl"))),
         false => &self.kernels.gemm_module,
       };
-      let decode = module(device, &source(include_str!("decode.wgsl")));
-      let ops = fast.then(|| module(device, &source(include_str!("ops.wgsl"))));
+      let decode = module(device, &swap(self.kernels.subgroup, include_str!("decode.wgsl")));
       Decoder {
-        layer_norm: ops.map(|ops| pipeline(device, &ops, "layer_norm", &[])),
         gemv: gemms(device, gemm, "gemv"),
         embed: gemms(device, gemm, "embed"),
         attend: pipeline(device, &decode, "attend", &[]),
@@ -1447,15 +1456,15 @@ impl<'a> Pass<'a> {
     }
   }
 
-  /// LayerNorm of one row of `cols` from `x` into `y`: the decoder's, with subgroup sums on the
-  /// fast tier.
+  /// LayerNorm of one row of `cols` from `x` into `y`: the decoder's, with subgroup reductions
+  /// when available.
   pub fn layer_norm_row(&mut self, x: &Buffer, n: &Channels, y: &Buffer, cols: usize) {
-    match &self.gpu.decoder().layer_norm {
-      Some(k) => {
-        self.run(k, &[x, &n.w, &n.b, y, x, &self.gpu.spare], &[1, cols as u32, 0], [1, 1, 1])
-      }
-      None => self.layer_norm(x, n, y, 1, cols, None),
-    }
+    self.run(
+      &self.gpu.kernels.layer_norm,
+      &[x, &n.w, &n.b, y, x, &self.gpu.spare],
+      &[1, cols as u32, 0],
+      [1, 1, 1],
+    );
   }
 
   /// `c[offset..]` = `epilogue(a·Wᵀ + b)` for one row `a`, W not rounded to f16.

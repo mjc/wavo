@@ -34,17 +34,27 @@ var<workgroup> s: array<f32, 256>;
 var<workgroup> red: array<f32, 256>;
 var<workgroup> rv: array<vec2<f32>, 256>;
 
-// Sum (or max) over the 256-thread workgroup. subgroup.wgsl has the fast version.
-fn reduce(v: f32, lid: u32, is_max: bool) -> f32 {
+// Sum or max over the 256-thread workgroup. subgroup.wgsl has the fast versions.
+fn reduce_sum(v: f32, lid: u32) -> f32 {
   red[lid] = v;
   workgroupBarrier();
   for (var h = 128u; h > 0u; h >>= 1u) {
     if (lid < h) {
-      if (is_max) {
-        red[lid] = max(red[lid], red[lid + h]);
-      } else {
-        red[lid] += red[lid + h];
-      }
+      red[lid] += red[lid + h];
+    }
+    workgroupBarrier();
+  }
+  let r = red[0];
+  workgroupBarrier();
+  return r;
+}
+
+fn reduce_max(v: f32, lid: u32) -> f32 {
+  red[lid] = v;
+  workgroupBarrier();
+  for (var h = 128u; h > 0u; h >>= 1u) {
+    if (lid < h) {
+      red[lid] = max(red[lid], red[lid + h]);
     }
     workgroupBarrier();
   }
@@ -84,13 +94,13 @@ fn attend(
     }
     x = acc * p.scale;
   }
-  let m = reduce(x, lid, true);
+  let m = reduce_max(x, lid);
   var e = 0.0;
   if (lid < n) {
     e = exp(x - m);
   }
   s[lid] = e;
-  let l = reduce(e, lid, false);
+  let l = reduce_sum(e, lid);
   // Thread (g, c) sums V pair c over keys g, g + groups, ...
   let groups = 256u / pairs;
   let c = lid % pairs;

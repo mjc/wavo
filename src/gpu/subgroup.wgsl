@@ -1,24 +1,56 @@
 // Copyright (c) vladkens | MIT License | https://github.com/vladkens/wavo
-// Subgroup versions of the decoder kernels' reductions: `Gpu::decoder` puts each in place of the
-// function of the same name in gemm.wgsl, decode.wgsl and ops.wgsl on GPUs with the fast tier,
-// whose subgroups are 32 consecutive invocations.
+// Subgroup versions of reductions: `Portable::new` puts `reduce_sum`/`reduce_max` into ops.wgsl
+// when `Features::SUBGROUP` is available (any subgroup width), and `Gpu::decoder` puts them (plus
+// `group_sums` for 32-lane subgroups) into gemm.wgsl and decode.wgsl.
 
 fn group_sums(s: vec4<f32>, lid: u32) -> vec4<f32> {
   return subgroupAdd(s);
 }
 
-fn reduce(v: f32, lid: u32, is_max: bool) -> f32 {
-  let r = select(subgroupAdd(v), subgroupMax(v), is_max);
-  if (lid % 32u == 0u) {
-    red[lid / 32u] = r;
+fn reduce_sum(v: f32, lid: u32) -> f32 {
+  let width = subgroupAdd(1u);
+  let r = subgroupAdd(v);
+  if (width >= 256u) {
+    return r;
+  }
+  let count = 256u / width;
+  let sl = lid % width;
+  if (sl == 0u) {
+    red[lid / width] = r;
   }
   workgroupBarrier();
-  var t = red[0];
-  for (var i = 1u; i < 8u; i++) {
-    if (is_max) {
-      t = max(t, red[i]);
-    } else {
+  var t = 0.0;
+  if (count <= width) {
+    let p = red[select(0u, sl, sl < count)];
+    t = subgroupAdd(select(0.0, p, sl < count));
+  } else {
+    for (var i = 0u; i < count; i++) {
       t += red[i];
+    }
+  }
+  workgroupBarrier();
+  return t;
+}
+
+fn reduce_max(v: f32, lid: u32) -> f32 {
+  let width = subgroupAdd(1u);
+  let r = subgroupMax(v);
+  if (width >= 256u) {
+    return r;
+  }
+  let count = 256u / width;
+  let sl = lid % width;
+  if (sl == 0u) {
+    red[lid / width] = r;
+  }
+  workgroupBarrier();
+  var t: f32;
+  if (count <= width) {
+    t = subgroupMax(red[select(0u, sl, sl < count)]);
+  } else {
+    t = red[0];
+    for (var i = 1u; i < count; i++) {
+      t = max(t, red[i]);
     }
   }
   workgroupBarrier();

@@ -21,18 +21,27 @@ var<workgroup> red: array<f32, 256>;
 // One row of up to 1024 channels.
 var<workgroup> row: array<f32, 1024>;
 
-// Sum (or max) over a 256-thread workgroup. subgroup.wgsl has the fast version, which the decoder's
-// LayerNorm uses.
-fn reduce(v: f32, lid: u32, is_max: bool) -> f32 {
+// Sum or max over a 256-thread workgroup. subgroup.wgsl has the fast versions.
+fn reduce_sum(v: f32, lid: u32) -> f32 {
   red[lid] = v;
   workgroupBarrier();
   for (var s = 128u; s > 0u; s >>= 1u) {
     if (lid < s) {
-      if (is_max) {
-        red[lid] = max(red[lid], red[lid + s]);
-      } else {
-        red[lid] += red[lid + s];
-      }
+      red[lid] += red[lid + s];
+    }
+    workgroupBarrier();
+  }
+  let r = red[0];
+  workgroupBarrier();
+  return r;
+}
+
+fn reduce_max(v: f32, lid: u32) -> f32 {
+  red[lid] = v;
+  workgroupBarrier();
+  for (var s = 128u; s > 0u; s >>= 1u) {
+    if (lid < s) {
+      red[lid] = max(red[lid], red[lid + s]);
     }
     workgroupBarrier();
   }
@@ -60,13 +69,13 @@ fn layer_norm(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_in
   for (var i = lid; i < p.ch; i += 256u) {
     s += norm_x[base + i];
   }
-  let mean = reduce(s, lid, false) / f32(p.ch);
+  let mean = reduce_sum(s, lid) / f32(p.ch);
   var q = 0.0;
   for (var i = lid; i < p.ch; i += 256u) {
     let d = norm_x[base + i] - mean;
     q += d * d;
   }
-  let rstd = inverseSqrt(reduce(q, lid, false) / f32(p.ch) + 1e-5);
+  let rstd = inverseSqrt(reduce_sum(q, lid) / f32(p.ch) + 1e-5);
   for (var i = lid; i < p.ch; i += 256u) {
     let v = (norm_x[base + i] - mean) * rstd * norm_g[i] + norm_b[i];
     norm_y[base + i] = v;
@@ -147,13 +156,13 @@ fn conv_glu(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_inde
     row[i] = acc;
     s += acc;
   }
-  let mean = reduce(s, lid, false) / f32(p.ch);
+  let mean = reduce_sum(s, lid) / f32(p.ch);
   var q = 0.0;
   for (var i = lid; i < p.ch; i += 256u) {
     let d = row[i] - mean;
     q += d * d;
   }
-  let rstd = inverseSqrt(reduce(q, lid, false) / f32(p.ch) + 1e-5);
+  let rstd = inverseSqrt(reduce_sum(q, lid) / f32(p.ch) + 1e-5);
   for (var i = lid; i < p.ch; i += 256u) {
     var y = row[i] * conv_g[i] + conv_beta[i];
     if (p.layer_norm != 0u) {
@@ -175,14 +184,14 @@ fn softmax(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_index
   for (var j = lid; j < p.t; j += 256u) {
     mx = max(mx, sm_s[base + j]);
   }
-  mx = reduce(mx, lid, true);
+  mx = reduce_max(mx, lid);
   var sum = 0.0;
   for (var j = lid; j < p.t; j += 256u) {
     let e = exp(sm_s[base + j] - mx);
     sm_s[base + j] = e;
     sum += e;
   }
-  let inv = 1.0 / reduce(sum, lid, false);
+  let inv = 1.0 / reduce_sum(sum, lid);
   for (var j = lid; j < p.t; j += 256u) {
     sm_s[base + j] *= inv;
   }
@@ -228,13 +237,13 @@ fn group_norm(@builtin(local_invocation_index) lid: u32) {
   for (var i = lid; i < n; i += 256u) {
     s += gn_x[i];
   }
-  let mean = reduce(s, lid, false) / f32(n);
+  let mean = reduce_sum(s, lid) / f32(n);
   var q = 0.0;
   for (var i = lid; i < n; i += 256u) {
     let d = gn_x[i] - mean;
     q += d * d;
   }
-  let rstd = 1.0 / sqrt(reduce(q, lid, false) / f32(n) + p.scale);
+  let rstd = 1.0 / sqrt(reduce_sum(q, lid) / f32(n) + p.scale);
   for (var i = lid; i < n; i += 256u) {
     gn_x[i] = (gn_x[i] - mean) * rstd * gn_w[i % p.ch] + gn_b[i % p.ch];
   }
@@ -276,12 +285,12 @@ fn argmax(@builtin(local_invocation_index) lid: u32) {
   for (var i = lid; i < p.t; i += 256u) {
     mx = max(mx, am_x[i]);
   }
-  mx = reduce(mx, lid, true);
+  mx = reduce_max(mx, lid);
   var first = -3.0e38;
   for (var i = lid; i < p.t; i += 256u) {
     first = select(first, max(first, -f32(i)), am_x[i] == mx);
   }
-  first = reduce(first, lid, true);
+  first = reduce_max(first, lid);
   if (lid == 0u) {
     am_out[0] = u32(-first);
   }
